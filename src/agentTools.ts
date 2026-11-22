@@ -103,15 +103,18 @@ export class AgentJobs {
     // If logging fails, do not launch an unacknowledged child.
     parent.emit("agent_job_started", job.snapshot());
     this.jobs.set(job.id, job);
-    job.promise = agent
-      .run(prompt, {
+    // Started on a later turn of the event loop: the tool returns the handle first.
+    job.promise = new Promise<void>((resolve) => setTimeout(resolve, 0))
+      .then(() =>
+        agent.run(prompt, {
         sessionId,
         context: options.context,
         parentSessionId: parent.sessionId,
         parentRunId: parent.id,
         jobId: job.id,
         signal: job.controller.signal,
-      })
+        }),
+      )
       .then(
         (run) => {
           job.result = runResult(run, job.toolName);

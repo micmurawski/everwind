@@ -1,6 +1,7 @@
 /** Compose nodes with .then() and .on(action, ...), then snapshot them into a runnable flow. */
 
 import type { Runtime } from "./runtime.ts";
+import { buildDot, buildMermaid, renderGraph } from "./viz.ts";
 
 export const END = "__end__";
 export type Action = string | null | undefined | void;
@@ -122,9 +123,17 @@ export class Flow {
     return this;
   }
 
-  async toMermaid(options: { direction?: string } = {}): Promise<string> {
-    const { buildMermaid } = await import("./viz.ts");
+  toMermaid(options: { direction?: string } = {}): string {
     return buildMermaid(this, options);
+  }
+
+  toDot(options: { direction?: string } = {}): string {
+    return buildDot(this, options);
+  }
+
+  /** Render a PNG or SVG with the local Graphviz `dot`. */
+  render(filename: string, options: { direction?: string; dot?: string } = {}): Promise<string> {
+    return renderGraph(this, filename, options);
   }
 
   async run(runtime: Runtime): Promise<void> {

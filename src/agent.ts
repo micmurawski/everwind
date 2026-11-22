@@ -28,6 +28,7 @@ import { SessionLog, validateSessionId } from "./sessionLog.ts";
 import { MemorySessionStore, type Session, type SessionStore, session as makeSession } from "./sessions.ts";
 import type { SharedWorld } from "./shared.ts";
 import { Tools } from "./tools.ts";
+import { type FlowSource, buildMermaid, renderGraph } from "./viz.ts";
 import {
   type Limits,
   type LimitsInput,
@@ -206,14 +207,14 @@ export class Agent {
     return new Agent({ ...this.options, sessions: this.sessions, ...changes });
   }
 
-  async flowGraph(options: { direction?: string } = {}): Promise<string> {
-    const { buildMermaid } = await import("./viz.ts");
-    return buildMermaid(this.loop as never, options);
+  /** Mermaid for a Flow loop, or a loop exposing toFlow(). */
+  flowGraph(options: { direction?: string } = {}): string {
+    return buildMermaid(this.loop as unknown as FlowSource, options);
   }
 
-  async renderGraph(filename: string, options: { direction?: string } = {}): Promise<string> {
-    const { renderGraph } = await import("./viz.ts");
-    return renderGraph(this.loop as never, filename, options);
+  /** Save a PNG or SVG locally using Graphviz. */
+  renderGraph(filename: string, options: { direction?: string; dot?: string } = {}): Promise<string> {
+    return renderGraph(this.loop as unknown as FlowSource, filename, options);
   }
 
   /**
@@ -487,10 +488,10 @@ export class Agent {
     if (options.signal?.aborted) onCancel();
     options.signal?.addEventListener("abort", onCancel, { once: true });
     // The timeout budget counts active execution only, not downtime between crash and recovery.
-    const deadline = setTimeout(
-      () => controller.abort(new DeadlineExceeded("Run deadline exceeded")),
-      Math.max(this.limits.timeout - activeBefore, 0) * 1000,
-    );
+    const remaining = this.limits.timeout - activeBefore;
+    const expire = () => controller.abort(new DeadlineExceeded("Run deadline exceeded"));
+    if (remaining <= 0) expire();
+    const deadline = setTimeout(expire, Math.max(remaining, 0) * 1000);
     const heartbeat = new AbortController();
 
     try {

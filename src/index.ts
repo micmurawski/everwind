@@ -61,15 +61,19 @@ export {
 } from "./shared.ts";
 export { type Effect, Tool, ToolContext, type ToolDefinition, ToolResult, Tools, tool } from "./tools.ts";
 export {
+  type CreateMessageMetadata,
   type Event,
   type Limits,
+  type LimitsInput,
   type Message,
   type MessageInput,
   type ModelRequest,
   type ModelResponse,
+  type ModelResponseInput,
   Run,
   type StreamChunk,
   type ToolCall,
+  type ToolCallInput,
   type ToolSpec,
   limits,
   message,
