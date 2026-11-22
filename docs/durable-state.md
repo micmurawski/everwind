@@ -50,7 +50,7 @@ Consequences for the design:
 
 This design borrows Temporal's execution model:
 
-| Temporal | tourbillon |
+| Temporal | everwind |
 |---|---|
 | Workflow code (must be deterministic) | `Loop` / `Flow` nodes |
 | Activities (side effects) | model calls, tool calls, shared-state operations, time, randomness |

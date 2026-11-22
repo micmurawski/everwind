@@ -1,6 +1,6 @@
 /** Error classes shared by every module. Each sets `name` to its class name. */
 
-export class TourbillonError extends Error {
+export class EverwindError extends Error {
   constructor(message: string, options?: ErrorOptions) {
     super(message, options);
     this.name = new.target.name;
@@ -8,19 +8,19 @@ export class TourbillonError extends Error {
 }
 
 /** The requested session log could not be opened or written. */
-export class SessionLogError extends TourbillonError {}
+export class SessionLogError extends EverwindError {}
 
 /** The journal could not be written. The run must stop without further effects. */
-export class JournalError extends TourbillonError {}
+export class JournalError extends EverwindError {}
 
 /** Another owner claimed this run (a newer epoch), or the run is no longer running. */
 export class RunOwnershipLost extends JournalError {}
 
 /** The run's current owner still holds a valid lease; pass `force: true` to take over. */
-export class RunLeaseHeld extends TourbillonError {}
+export class RunLeaseHeld extends EverwindError {}
 
 /** Replay produced a different command than the journal recorded at this position. */
-export class NonDeterminismError extends TourbillonError {
+export class NonDeterminismError extends EverwindError {
   constructor(
     readonly seq: number,
     readonly expected: string,
@@ -49,7 +49,7 @@ export class VersionUnsupported extends NonDeterminismError {
 }
 
 /** The agent's configuration differs from the one the run was recorded with. */
-export class ConfigurationChanged extends TourbillonError {
+export class ConfigurationChanged extends EverwindError {
   constructor(readonly changed: readonly string[]) {
     super(
       `Configuration changed since the run was recorded: ${changed.join(", ")}. ` +
@@ -59,7 +59,7 @@ export class ConfigurationChanged extends TourbillonError {
 }
 
 /** Inspection replay reached a command it must not perform. */
-export class ReplayExhausted extends TourbillonError {
+export class ReplayExhausted extends EverwindError {
   constructor(
     readonly seq: number,
     readonly reason: string,
@@ -69,16 +69,16 @@ export class ReplayExhausted extends TourbillonError {
 }
 
 /** A run budget (model calls, tool calls, steps) was exhausted. */
-export class LimitReached extends TourbillonError {}
+export class LimitReached extends EverwindError {}
 
 /** A run or tool deadline passed. */
-export class DeadlineExceeded extends TourbillonError {}
+export class DeadlineExceeded extends EverwindError {}
 
 /** The caller cancelled the run. */
-export class Cancelled extends TourbillonError {}
+export class Cancelled extends EverwindError {}
 
 /** A tool needed a context value the run was not given. */
-export class MissingContext extends TourbillonError {}
+export class MissingContext extends EverwindError {}
 
 /**
  * Errors that must never become a tool observation or a failed run: the journal

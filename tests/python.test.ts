@@ -129,7 +129,7 @@ describe.skipIf(PYTHON === null)("Python sandbox", () => {
     expect(result.stateLost).toBe(true);
     expect(broken.process).toBeNull();
     await broken.close();
-    const missing = new DockerPythonSandbox({ docker: "/does-not-exist/tbln-docker" });
+    const missing = new DockerPythonSandbox({ docker: "/does-not-exist/everwind-docker" });
     const failed = await missing.execute("print('never')");
     expect(failed.error).toMatch(/ENOENT|No such file|not found/i);
     expect(failed.stateLost).toBe(true);
@@ -216,13 +216,13 @@ test("the Docker command uses explicit mounts and publishes no ports", () => {
   expect(command).toContain(`type=bind,source=${real},target=/inputs,readonly`);
   expect(command).toContain(`type=bind,source=${real},target=/workspace`);
   expect(command.some((arg) => arg.includes("/workspace:rw"))).toBe(false);
-  for (const target of ["relative", "/", "/opt/tbln_worker.py", "/some/../where"]) {
+  for (const target of ["relative", "/", "/opt/everwind_worker.py", "/some/../where"]) {
     const bad = new DockerPythonSandbox({ mounts: [{ source: directory, target }] });
     expect(() => bad.createCommand()).toThrow(/mount/);
   }
 });
 
-test.skipIf(process.env.TBLN_TEST_DOCKER !== "1")("real Docker: state, mounts, timeout and cleanup", async () => {
+test.skipIf(process.env.EVERWIND_TEST_DOCKER !== "1")("real Docker: state, mounts, timeout and cleanup", async () => {
   const directory = tmpDir();
   require("node:fs").writeFileSync(`${directory}/input.txt`, "hello");
   const sandbox = new DockerPythonSandbox({ mounts: [{ source: directory, target: "/inputs" }], timeout: 0.5 });

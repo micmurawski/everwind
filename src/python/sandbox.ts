@@ -7,7 +7,7 @@ import { fileURLToPath } from "node:url";
 import { KeyedMutex, hexId } from "../util.ts";
 
 export const WORKER_PATH = fileURLToPath(new URL("./worker.py", import.meta.url));
-const WORKER_TARGET = "/opt/tbln_worker.py";
+const WORKER_TARGET = "/opt/everwind_worker.py";
 
 export interface PythonResult {
   stdout: string;
@@ -232,7 +232,7 @@ export class DockerPythonSandbox implements PythonSandbox {
   }
 
   private async start(): Promise<void> {
-    this.name = `tbln-python-${hexId()}`;
+    this.name = `everwind-python-${hexId()}`;
     this.diagnostics = "";
     await this.createContainer();
     const child = Bun.spawn(this.attachCommand(), { stdin: "pipe", stdout: "pipe", stderr: "pipe" });

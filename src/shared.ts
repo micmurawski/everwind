@@ -8,7 +8,7 @@
  * See docs/durable-state.md, sections 6.1, 6.2 and 7.
  */
 
-import { JournalError, TourbillonError } from "./errors.ts";
+import { JournalError, EverwindError } from "./errors.ts";
 import { type DurableStore, type JournalEntry, type KeyedEvent, type Tx, commandKey, owned } from "./journal.ts";
 import type { Runtime } from "./runtime.ts";
 import { type Json, type JsonObject, hexId, stableStringify } from "./util.ts";
@@ -18,7 +18,7 @@ export const MAX_ENTRY_BYTES = 256 * 1024;
 const MISSING = Symbol("missing");
 type Found = Json | typeof MISSING;
 
-export class SharedError extends TourbillonError {}
+export class SharedError extends EverwindError {}
 
 /** The patch is malformed. Raised before anything is journaled or committed. */
 export class InvalidPatch extends SharedError {}

@@ -19,7 +19,7 @@ test("the session log contains metadata, conversation, tool events and outcome",
   expect(run.status).toBe("completed");
   expect(run.sessionId).toBe("dinner-01");
   expect(run.id).not.toBe(run.sessionId);
-  expect(run.logPath).toBe(join(directory, "nested", "tbln-dinner-01.jsonl"));
+  expect(run.logPath).toBe(join(directory, "nested", "everwind-dinner-01.jsonl"));
   const data = records(run.logPath as string);
   expect(data.length).toBe(run.events.length);
   expect(data.map((row) => row.sequence)).toEqual(data.map((_, index) => index));
@@ -54,7 +54,7 @@ test("chunks are written before the turn finishes, and cancellation is logged", 
   const pending = new Agent({ provider, logDir: directory }).run("Task", { sessionId: "live", signal: controller.signal });
   await started;
   await Bun.sleep(1);
-  const path = join(directory, "tbln-live.jsonl");
+  const path = join(directory, "everwind-live.jsonl");
   const before = records(path);
   expect(before.at(-1).kind).toBe("model_chunk");
   expect(before.at(-1).data.chunk.text).toBe("First token");
@@ -92,7 +92,7 @@ test("concurrent sessions have separate files, and a run can override the direct
   expect(join(first.logPath as string, "..")).not.toBe(join(second.logPath as string, ".."));
   for (const run of [first, second]) {
     expect(new Set(records(run.logPath as string).map((row) => row.sessionId))).toEqual(new Set([run.sessionId]));
-    expect((run.logPath as string).endsWith(`tbln-${run.sessionId}.jsonl`)).toBe(true);
+    expect((run.logPath as string).endsWith(`everwind-${run.sessionId}.jsonl`)).toBe(true);
   }
 });
 
@@ -103,7 +103,7 @@ test("logging is opt-in", async () => {
 
 test("an existing session log is not overwritten", async () => {
   const directory = tmpDir();
-  const path = join(directory, "tbln-existing.jsonl");
+  const path = join(directory, "everwind-existing.jsonl");
   writeFileSync(path, "original\n");
   await expect(new Agent({ provider: new ScriptedProvider([]), logDir: directory }).run("Task", { sessionId: "existing" })).rejects.toThrow(/Cannot create/);
   expect(readFileSync(path, "utf-8")).toBe("original\n");

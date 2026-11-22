@@ -1,4 +1,4 @@
-"""Stdlib-only interpreter entry point, executed INSIDE the Python container (tourbillon)."""
+"""Stdlib-only interpreter entry point, executed INSIDE the Python container (everwind)."""
 
 import ast
 import json

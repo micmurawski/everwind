@@ -200,7 +200,7 @@ export function tmpDir(): string {
   const { mkdtempSync } = require("node:fs") as typeof import("node:fs");
   const { tmpdir } = require("node:os") as typeof import("node:os");
   const { join } = require("node:path") as typeof import("node:path");
-  return mkdtempSync(join(tmpdir(), "tbln-test-"));
+  return mkdtempSync(join(tmpdir(), "everwind-test-"));
 }
 
 export type { ModelResponse };

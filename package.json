@@ -1,5 +1,5 @@
 {
-  "name": "@micmurawski/tourbillon",
+  "name": "everwind",
   "version": "0.1.0",
   "description": "Small, explicit, durable agent loops for TypeScript and Bun",
   "keywords": [
@@ -12,11 +12,11 @@
   ],
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/micmurawski/tourbillon.git"
+    "url": "git+https://github.com/micmurawski/everwind.git"
   },
-  "homepage": "https://github.com/micmurawski/tourbillon#readme",
+  "homepage": "https://github.com/micmurawski/everwind#readme",
   "bugs": {
-    "url": "https://github.com/micmurawski/tourbillon/issues"
+    "url": "https://github.com/micmurawski/everwind/issues"
   },
   "type": "module",
   "main": "./dist/index.js",

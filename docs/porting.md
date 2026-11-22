@@ -1,6 +1,6 @@
 # Porting from mickro-agent (Python)
 
-tourbillon is the TypeScript and Bun port of mickro-agent. Behaviour is the same, and
+everwind is the TypeScript and Bun port of mickro-agent. Behaviour is the same, and
 the test suite was ported test by test; the API follows TypeScript conventions.
 
 | Python | TypeScript |
@@ -19,7 +19,7 @@ the test suite was ported test by test; the API follows TypeScript conventions.
 | `asyncio.Queue` mailbox | `Mailbox` |
 | `async with AgentJobs(...)` | `await jobs.close()` |
 | `Limits(timeout=...)` | `limits: { timeout }` (seconds, as before) |
-| `mikro-agent-<id>.jsonl`, `schema_version: 2` | `tbln-<id>.jsonl`, `schemaVersion: 1` |
+| `mikro-agent-<id>.jsonl`, `schema_version: 2` | `everwind-<id>.jsonl`, `schemaVersion: 1` |
 | `MiniMax` content in `metadata["minimax_content"]` | `metadata.minimaxContent` |
 
 ## Behaviour that differs

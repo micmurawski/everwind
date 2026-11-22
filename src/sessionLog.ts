@@ -16,7 +16,7 @@ export function validateSessionId(sessionId: unknown): asserts sessionId is stri
 }
 
 export function logFileName(sessionId: string): string {
-  return `tbln-${sessionId}.jsonl`;
+  return `everwind-${sessionId}.jsonl`;
 }
 
 export function eventLine(event: Event): string {

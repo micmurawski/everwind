@@ -1,4 +1,4 @@
-# tourbillon (tbln)
+# everwind
 
 Small, explicit agent loops for TypeScript on [Bun](https://bun.sh), with durable runs
 that survive crashes, replay deterministically and share state between agents.
@@ -19,12 +19,12 @@ No service is required: a run needs a provider, and durability needs one SQLite 
 ## Install
 
 ```sh
-bun add @micmurawski/tourbillon zod
+bun add everwind zod
 bun add openai               # optional: OpenAIChat
 bun add @anthropic-ai/sdk    # optional: MiniMax
 ```
 
-The package is published as `@micmurawski/tourbillon` (the name `tourbillon` was taken on npm). It needs
+The package is published as `everwind`. It needs
 Bun: the SQLite store uses `bun:sqlite`.
 
 ## Development
@@ -42,7 +42,7 @@ Bump `version` in `package.json`, merge to `main`, then publish a GitHub release
 tagged `v<version>` (for example `v0.1.0`). The `Publish to npm` workflow checks that
 the tag matches, runs the tests, builds and publishes with provenance. It can also be
 started by hand as a dry run. It publishes with npm trusted publishing (configure
-`micmurawski/tourbillon`, workflow `publish.yml`, environment `npm` on npmjs.com), or
+`micmurawski/everwind`, workflow `publish.yml`, environment `npm` on npmjs.com), or
 with an `NPM_TOKEN` secret in the `npm` environment: a granular token for all packages
 with "bypass two-factor authentication" enabled.
 
@@ -50,7 +50,7 @@ with "bypass two-factor authentication" enabled.
 
 ```ts
 import { z } from "zod";
-import { Agent, OpenAIChat, Tools, tool } from "@micmurawski/tourbillon";
+import { Agent, OpenAIChat, Tools, tool } from "everwind";
 
 const multiply = tool({
   name: "multiply",
@@ -98,7 +98,7 @@ const lookup = tool({
 ## Loops and flows
 
 ```ts
-import { END, Flow, finishStep, modelStep, node, toolsStep } from "@micmurawski/tourbillon";
+import { END, Flow, finishStep, modelStep, node, toolsStep } from "everwind";
 
 const callLlm = node(modelStep, { name: "call_llm" });
 const tools = node(toolsStep, { name: "tools" });
@@ -129,14 +129,14 @@ applied. `ReActWithSummary` summarizes before each model turn once a threshold i
 
 `agent.run(prompt, { sessionId })` continues a conversation. Without a store, sessions
 are kept in memory, or in `FileSessionStore(directory)`; `logDir` writes one JSONL log
-per session (`tbln-<session>.jsonl`). Concurrent continuations of one session are
+per session (`everwind-<session>.jsonl`). Concurrent continuations of one session are
 serialized. An interrupted tool call is closed with an "Outcome unknown" result rather
 than repeated.
 
 ## Durable runs and crash recovery
 
 ```ts
-import { Agent, SqliteStore, Worker } from "@micmurawski/tourbillon";
+import { Agent, SqliteStore, Worker } from "everwind";
 
 const store = new SqliteStore("artifacts/durable.db"); // WAL, one file, one process
 const agent = new Agent({ provider, tools, name: "worker", store });
@@ -195,7 +195,7 @@ each outcome to a `Mailbox`, and `AGENT_JOB_TOOLS` list, inspect and cancel jobs
 
 ## Python execution
 
-`@micmurawski/tourbillon/python` runs model-written Python in a locked-down Docker container
+`everwind/python` runs model-written Python in a locked-down Docker container
 (no network, read-only root, explicit mounts): `pythonTools(new PythonSessions())`
 gives each session its own persistent interpreter.
 
