@@ -19,12 +19,12 @@ No service is required: a run needs a provider, and durability needs one SQLite 
 ## Install
 
 ```sh
-bun add tbln zod
+bun add @micmurawski/tourbillon zod
 bun add openai               # optional: OpenAIChat
 bun add @anthropic-ai/sdk    # optional: MiniMax
 ```
 
-The package is published as `tbln` (the name `tourbillon` was taken on npm). It needs
+The package is published as `@micmurawski/tourbillon` (the name `tourbillon` was taken on npm). It needs
 Bun: the SQLite store uses `bun:sqlite`.
 
 ## Development
@@ -50,7 +50,7 @@ with "bypass two-factor authentication" enabled.
 
 ```ts
 import { z } from "zod";
-import { Agent, OpenAIChat, Tools, tool } from "tbln";
+import { Agent, OpenAIChat, Tools, tool } from "@micmurawski/tourbillon";
 
 const multiply = tool({
   name: "multiply",
@@ -98,7 +98,7 @@ const lookup = tool({
 ## Loops and flows
 
 ```ts
-import { END, Flow, finishStep, modelStep, node, toolsStep } from "tbln";
+import { END, Flow, finishStep, modelStep, node, toolsStep } from "@micmurawski/tourbillon";
 
 const callLlm = node(modelStep, { name: "call_llm" });
 const tools = node(toolsStep, { name: "tools" });
@@ -136,7 +136,7 @@ than repeated.
 ## Durable runs and crash recovery
 
 ```ts
-import { Agent, SqliteStore, Worker } from "tbln";
+import { Agent, SqliteStore, Worker } from "@micmurawski/tourbillon";
 
 const store = new SqliteStore("artifacts/durable.db"); // WAL, one file, one process
 const agent = new Agent({ provider, tools, name: "worker", store });
@@ -195,7 +195,7 @@ each outcome to a `Mailbox`, and `AGENT_JOB_TOOLS` list, inspect and cancel jobs
 
 ## Python execution
 
-`tbln/python` runs model-written Python in a locked-down Docker container
+`@micmurawski/tourbillon/python` runs model-written Python in a locked-down Docker container
 (no network, read-only root, explicit mounts): `pythonTools(new PythonSessions())`
 gives each session its own persistent interpreter.
 

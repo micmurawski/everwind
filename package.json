@@ -1,5 +1,5 @@
 {
-  "name": "tbln",
+  "name": "@micmurawski/tourbillon",
   "version": "0.1.0",
   "description": "Small, explicit, durable agent loops for TypeScript and Bun",
   "keywords": [
