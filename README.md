@@ -16,17 +16,38 @@ that survive crashes, replay deterministically and share state between agents.
 
 No service is required: a run needs a provider, and durability needs one SQLite file.
 
+## Install
+
+```sh
+bun add tbln zod
+bun add openai               # optional: OpenAIChat
+bun add @anthropic-ai/sdk    # optional: MiniMax
+```
+
+The package is published as `tbln` (the name `tourbillon` was taken on npm). It needs
+Bun: the SQLite store uses `bun:sqlite`.
+
+## Development
+
 ```sh
 bun install
 bun test            # the full suite, offline
 bun run typecheck
+bun run build       # dist/: JS and type declarations
 ```
+
+### Releasing
+
+Bump `version` in `package.json`, merge to `main`, then publish a GitHub release
+tagged `v<version>` (for example `v0.1.0`). The `Publish to npm` workflow checks that
+the tag matches, runs the tests, builds and publishes with provenance. It can also be
+started by hand as a dry run. It needs an `NPM_TOKEN` secret in the `npm` environment.
 
 ## A first agent
 
 ```ts
 import { z } from "zod";
-import { Agent, OpenAIChat, Tools, tool } from "tourbillon";
+import { Agent, OpenAIChat, Tools, tool } from "tbln";
 
 const multiply = tool({
   name: "multiply",
@@ -74,7 +95,7 @@ const lookup = tool({
 ## Loops and flows
 
 ```ts
-import { END, Flow, finishStep, modelStep, node, toolsStep } from "tourbillon";
+import { END, Flow, finishStep, modelStep, node, toolsStep } from "tbln";
 
 const callLlm = node(modelStep, { name: "call_llm" });
 const tools = node(toolsStep, { name: "tools" });
@@ -112,7 +133,7 @@ than repeated.
 ## Durable runs and crash recovery
 
 ```ts
-import { Agent, SqliteStore, Worker } from "tourbillon";
+import { Agent, SqliteStore, Worker } from "tbln";
 
 const store = new SqliteStore("artifacts/durable.db"); // WAL, one file, one process
 const agent = new Agent({ provider, tools, name: "worker", store });
@@ -171,7 +192,7 @@ each outcome to a `Mailbox`, and `AGENT_JOB_TOOLS` list, inspect and cancel jobs
 
 ## Python execution
 
-`tourbillon/python` runs model-written Python in a locked-down Docker container
+`tbln/python` runs model-written Python in a locked-down Docker container
 (no network, read-only root, explicit mounts): `pythonTools(new PythonSessions())`
 gives each session its own persistent interpreter.
 
