@@ -33,6 +33,9 @@ jobs:
         with:
           node-version: 22
           registry-url: https://registry.npmjs.org
+      # npm 11.5+ publishes with GitHub OIDC (trusted publishing) when it is set up on
+      # npmjs.com; until then, or as a fallback, it uses the NPM_TOKEN secret.
+      - run: npm install -g npm@latest
 
       - name: Check the tag matches package.json
         if: github.event_name == 'release'

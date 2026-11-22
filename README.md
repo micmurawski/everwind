@@ -41,7 +41,10 @@ bun run build       # dist/: JS and type declarations
 Bump `version` in `package.json`, merge to `main`, then publish a GitHub release
 tagged `v<version>` (for example `v0.1.0`). The `Publish to npm` workflow checks that
 the tag matches, runs the tests, builds and publishes with provenance. It can also be
-started by hand as a dry run. It needs an `NPM_TOKEN` secret in the `npm` environment.
+started by hand as a dry run. It publishes with npm trusted publishing (configure
+`micmurawski/tourbillon`, workflow `publish.yml`, environment `npm` on npmjs.com), or
+with an `NPM_TOKEN` secret in the `npm` environment: a granular token for all packages
+with "bypass two-factor authentication" enabled.
 
 ## A first agent
 
