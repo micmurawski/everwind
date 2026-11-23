@@ -20,6 +20,7 @@ the test suite was ported test by test; the API follows TypeScript conventions.
 | `async with AgentJobs(...)` | `await jobs.close()` |
 | `Limits(timeout=...)` | `limits: { timeout }` (seconds, as before) |
 | `mikro-agent-<id>.jsonl`, `schema_version: 2` | `everwind-<id>.jsonl`, `schemaVersion: 1` |
+| `SummaryHistory(keep_recent_messages)` | `OlderMessages(keepRecentMessages)` |
 | `MiniMax` content in `metadata["minimax_content"]` | `metadata.minimaxContent` |
 
 ## Behaviour that differs

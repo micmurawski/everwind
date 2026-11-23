@@ -10,7 +10,7 @@ import {
   SUMMARY_PROMPT,
   ScriptedProvider,
   Summarize,
-  SummaryHistory,
+  OlderMessages,
   Tools,
   limits,
   message,
@@ -38,7 +38,7 @@ const transcript = (request: any) => JSON.parse(request.messages[1].content.spli
 test("the summary window keeps the first and recent messages and rolls forward", async () => {
   const rt = makeRuntime(conversation(), new ScriptedProvider([{ text: "First summary" }, { text: "Second summary" }]));
   const original = [...rt.run.messages];
-  const first = await rt.compact({ selection: new SummaryHistory(), strategy: new Summarize(), tokenCounter: countTokens });
+  const first = await rt.compact({ selection: new OlderMessages(), strategy: new Summarize(), tokenCounter: countTokens });
   expect(first.applied).toBe(true);
   expect(first.afterTokens as number).toBeLessThan(first.beforeTokens as number);
   expect(rt.run.messages.slice(0, 2)).toEqual(original.slice(0, 2));
@@ -46,7 +46,7 @@ test("the summary window keeps the first and recent messages and rolls forward",
   expect(rt.run.messages[2].content).toBe("First summary");
   // Once enough new history accumulates, the preceding summary is input to the next one.
   rt.run.messages.push(...Array.from({ length: 3 }, () => message({ role: "user", content: "More work. ".repeat(30) })));
-  const second = await rt.compact({ selection: new SummaryHistory(), strategy: new Summarize(), tokenCounter: countTokens });
+  const second = await rt.compact({ selection: new OlderMessages(), strategy: new Summarize(), tokenCounter: countTokens });
   expect(second.applied).toBe(true);
   expect(rt.run.messages[2].content).toBe("Second summary");
   const sent = requests(rt);
@@ -62,7 +62,7 @@ for (const metadata of [{ compaction: { kind: "summary" } }, { isSummary: true }
     const messages = conversation();
     messages.splice(3, 1, message({ role: "assistant", content: "Last summary", metadata }), message({ role: "user", content: "New findings. ".repeat(30) }));
     const rt = makeRuntime(messages);
-    const result = await rt.compact({ selection: new SummaryHistory(), strategy: new Summarize({ prompt: "Custom instructions" }), tokenCounter: countTokens });
+    const result = await rt.compact({ selection: new OlderMessages(), strategy: new Summarize({ prompt: "Custom instructions" }), tokenCounter: countTokens });
     expect(result.applied).toBe(true);
     const request = requests(rt)[0];
     expect(request.messages[0].content).toBe("Custom instructions");
@@ -80,7 +80,7 @@ test("the summary window expands the tail for parallel tool results", async () =
     message({ role: "assistant", content: "Latest answer" }),
   ];
   const rt = makeRuntime(messages);
-  const result = await rt.compact({ selection: new SummaryHistory(), strategy: new Summarize(), tokenCounter: countTokens });
+  const result = await rt.compact({ selection: new OlderMessages(), strategy: new Summarize(), tokenCounter: countTokens });
   expect([result.applied, result.stop]).toEqual([true, 4]);
   expect(rt.run.messages.slice(3)).toEqual(messages.slice(-4));
   validateConversation(rt.run.messages);
@@ -90,7 +90,7 @@ for (let size = 0; size < 7; size++) {
   test(`a short history (${size}) is not summarized`, async () => {
     const rt = makeRuntime(conversation().slice(0, size));
     const original = [...rt.run.messages];
-    const result = await rt.compact({ selection: new SummaryHistory(), strategy: new Summarize(), tokenCounter: countTokens });
+    const result = await rt.compact({ selection: new OlderMessages(), strategy: new Summarize(), tokenCounter: countTokens });
     expect([result.applied, result.reason]).toEqual([false, "not_enough_messages"]);
     expect(rt.run.messages).toEqual(original);
     expect(rt.run.modelCalls).toBe(0);
@@ -101,12 +101,12 @@ test("a recent summary or a non-shrinking summary leaves history unchanged", asy
   let rt = makeRuntime(conversation());
   rt.run.messages[rt.run.messages.length - 2].metadata.compaction = { kind: "summary" };
   let original = [...rt.run.messages];
-  const skipped = await rt.compact({ selection: new SummaryHistory(), strategy: new Summarize(), tokenCounter: countTokens });
+  const skipped = await rt.compact({ selection: new OlderMessages(), strategy: new Summarize(), tokenCounter: countTokens });
   expect([skipped.reason, rt.run.modelCalls]).toEqual(["recent_summary", 0]);
   expect(rt.run.messages).toEqual(original);
   rt = makeRuntime(conversation(), new ScriptedProvider([{ text: "Huge summary".repeat(500) }]));
   original = [...rt.run.messages];
-  const rejected = await rt.compact({ selection: new SummaryHistory(), strategy: new Summarize(), tokenCounter: countTokens });
+  const rejected = await rt.compact({ selection: new OlderMessages(), strategy: new Summarize(), tokenCounter: countTokens });
   expect([rejected.reason, rt.run.modelCalls]).toEqual(["not_smaller", 1]);
   expect(rt.run.messages).toEqual(original);
 });

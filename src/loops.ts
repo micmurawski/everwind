@@ -1,6 +1,6 @@
 /** Loop recipes built from the same model and tool execution primitives. */
 
-import { Summarize, SummaryHistory, type TokenCounter } from "./contextOps.ts";
+import { OlderMessages, Summarize, type TokenCounter } from "./contextOps.ts";
 import { END, Flow, Node, node } from "./flow.ts";
 import type { Runtime } from "./runtime.ts";
 
@@ -66,7 +66,7 @@ export interface ReActWithSummaryOptions {
 }
 
 /**
- * ReAct with a legacy-style summary window checked before every model turn.
+ * ReAct that summarizes older messages (OlderMessages) before a model turn once a token threshold is hit.
  *
  * Supply a counter for the execution model, including request overhead as
  * needed. Summarize at thresholdPercent, or within the 10% context buffer plus
@@ -100,7 +100,7 @@ export class ReActWithSummary implements Loop {
       throw new Error("Output reserve and 10% buffer must leave room for conversation");
     }
     if (typeof this.tokenCounter !== "function") throw new TypeError("tokenCounter must be an async function");
-    new SummaryHistory(this.keepRecentMessages);
+    new OlderMessages(this.keepRecentMessages);
   }
 
   toFlow(): Flow {
@@ -111,7 +111,7 @@ export class ReActWithSummary implements Loop {
         const allowed = this.contextWindow * 0.9 - this.maxOutputTokens;
         if (tokens * 100 >= this.contextWindow * this.thresholdPercent || tokens > allowed) {
           await runtime.compact({
-            selection: new SummaryHistory(this.keepRecentMessages),
+            selection: new OlderMessages(this.keepRecentMessages),
             strategy: this.summary,
             tokenCounter: this.tokenCounter,
           });

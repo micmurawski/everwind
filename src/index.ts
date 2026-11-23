@@ -7,11 +7,11 @@ export {
   MessageMarker,
   MessageRange,
   OlderHistory,
+  OlderMessages,
   Remove,
   Replace,
   SUMMARY_PROMPT,
   Summarize,
-  SummaryHistory,
   type TokenCounter,
   isSummary,
 } from "./contextOps.ts";

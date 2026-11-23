@@ -120,7 +120,7 @@ A node returns an action string, or nothing for `"default"`. `ReAct`, `PlanThenA
 
 `runtime.compact({ selection, strategy, tokenCounter })` replaces a region of the
 conversation. Selections are `MessageRange` (between `markMessages()` markers),
-`OlderHistory` and `SummaryHistory`; strategies are `Remove`, `Replace(text)`,
+`OlderHistory` and `OlderMessages`; strategies are `Remove`, `Replace(text)`,
 `Summarize` (a budgeted, tool-free model call) or your own. A proposal that breaks tool
 history, adds a system message or doesn't shrink the context (with a counter) is not
 applied. `ReActWithSummary` summarizes before each model turn once a threshold is hit.

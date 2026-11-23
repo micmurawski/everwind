@@ -8,7 +8,7 @@ import {
   MessageRange,
   OlderHistory,
   type Selection,
-  SummaryHistory,
+  OlderMessages,
   type TokenCounter,
   isSummary,
 } from "./contextOps.ts";
@@ -540,7 +540,7 @@ export class Runtime {
       if (users.length <= selection.keepRecentTurns) return [messages.length, messages.length];
       start = users[0] + 1;
       stop = users[users.length - selection.keepRecentTurns];
-    } else if (selection instanceof SummaryHistory) {
+    } else if (selection instanceof OlderMessages) {
       const first = messages.length && messages[0].role === "system" ? 1 : 0;
       start = Math.min(first + 1, messages.length);
       stop = Math.max(start, messages.length - selection.keepRecentMessages);
@@ -548,7 +548,7 @@ export class Runtime {
       // including parallel calls returned in a different order.
       while (stop > start && messages[stop].role === "tool") stop -= 1;
     } else {
-      throw new TypeError("selection must be a MessageRange, OlderHistory or SummaryHistory");
+      throw new TypeError("selection must be a MessageRange, OlderHistory or OlderMessages");
     }
     if (start > stop) throw new Error("Compaction range starts after its stop marker");
     if (messages.slice(start, stop).some((item) => item.role === "system")) throw new Error("Compaction cannot replace system messages");
@@ -578,7 +578,7 @@ export class Runtime {
     const snapshot = clone(this.run.messages);
     const source = snapshot.slice(start, stop);
     let skip: string | null = source.length ? null : "empty_selection";
-    if (selection instanceof SummaryHistory) {
+    if (selection instanceof OlderMessages) {
       if (snapshot.slice(stop).some(isSummary)) skip = "recent_summary";
       else if (source.length < 2 && !source.some(isSummary)) skip = "not_enough_messages";
     }

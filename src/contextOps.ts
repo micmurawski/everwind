@@ -89,19 +89,22 @@ export class OlderHistory {
 }
 
 /**
- * Legacy summary window: preserve the first message and at least N recent messages.
+ * Select everything between the first message and the last N messages.
  *
- * The system prompt is also preserved. Expand the recent tail to keep tool
- * calls with all their results. Skip if that tail contains a summary or there
- * is too little older history to summarize.
+ * Counts messages, not user turns, so it also works for a long tool-using run
+ * that has a single user message (where OlderHistory finds nothing). The system
+ * prompt and the first message are kept. The recent tail is extended backwards
+ * so a tool call is never separated from its results. Compaction skips when the
+ * tail already contains a summary, or when fewer than 2 messages would be
+ * replaced; an earlier summary inside the selection is folded into the new one.
  */
-export class SummaryHistory {
+export class OlderMessages {
   constructor(readonly keepRecentMessages = 3) {
     positiveInteger(keepRecentMessages, "keepRecentMessages");
   }
 }
 
-export type Selection = MessageRange | OlderHistory | SummaryHistory;
+export type Selection = MessageRange | OlderHistory | OlderMessages;
 
 export function isSummary(item: Message): boolean {
   const compaction = item.metadata.compaction;
