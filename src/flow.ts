@@ -1,28 +1,45 @@
 /** Compose nodes with .then() and .on(action, ...), then snapshot them into a runnable flow. */
 
+import { NonDeterminismError } from "./errors.ts";
 import type { Runtime } from "./runtime.ts";
 import { buildDot, buildMermaid, renderGraph } from "./viz.ts";
 
 export const END = "__end__";
 export type Action = string | null | undefined | void;
 export type Step = (runtime: Runtime) => Action | Promise<Action>;
+/** Whether to write a checkpoint before entering a node; see NodeOptions.checkpoint. */
+export type CheckpointPolicy = boolean | ((runtime: Runtime) => boolean);
+
+export interface NodeOptions {
+  name?: string;
+  metadata?: Record<string, unknown>;
+  /**
+   * Write a checkpoint before entering this node (when the predicate holds),
+   * so a recovered run restarts here instead of replaying from the start. Use
+   * it before a node that may wait a long time. An applied compaction also
+   * requests one at the next node boundary.
+   */
+  checkpoint?: CheckpointPolicy;
+}
 type Target = Node | typeof END;
 
 /** A graph-building handle. Execution state lives on Runtime, never on this node. */
 export class Node {
   readonly name: string;
   readonly metadata: Record<string, unknown>;
+  readonly checkpoint: CheckpointPolicy;
   /** @internal */
   readonly successors = new Map<string, Target>();
 
   constructor(
     readonly fn: Step,
-    options: { name?: string; metadata?: Record<string, unknown> } = {},
+    options: NodeOptions = {},
   ) {
     if (typeof fn !== "function") throw new TypeError("A node requires a function");
     this.name = options.name ?? fn.name;
     if (!this.name || this.name === END) throw new Error("Node names must be nonempty; __end__ is reserved");
     this.metadata = structuredClone(options.metadata ?? {});
+    this.checkpoint = options.checkpoint ?? false;
   }
 
   /** Route `action` to `target`; returns this node, so routes can be chained. */
@@ -44,7 +61,7 @@ export class Node {
 }
 
 /** Wrap a function as a node: `node(fn)` or `node(fn, { name })`. */
-export function node(fn: Step, options: { name?: string; metadata?: Record<string, unknown> } = {}): Node {
+export function node(fn: Step, options: NodeOptions = {}): Node {
   return new Node(fn, options);
 }
 
@@ -55,12 +72,14 @@ export interface FlowMappings {
   nodes: Readonly<Record<string, Step>>;
   edges: Edges;
   nodeMetadata?: Readonly<Record<string, Record<string, unknown>>>;
+  checkpoints?: Readonly<Record<string, CheckpointPolicy>>;
 }
 
 function compile(start: Node): FlowMappings {
   const nodes: Record<string, Step> = {};
   const edges: Record<string, Record<string, string>> = {};
   const metadata: Record<string, Record<string, unknown>> = {};
+  const checkpoints: Record<string, CheckpointPolicy> = {};
   const names = new Map<string, Node>();
   const pending = [start];
   const visited = new Set<Node>();
@@ -75,6 +94,7 @@ function compile(start: Node): FlowMappings {
     names.set(current.name, current);
     nodes[current.name] = current.fn;
     metadata[current.name] = structuredClone(current.metadata);
+    if (current.checkpoint !== false) checkpoints[current.name] = current.checkpoint;
     // A leaf ends on the default action. Named actions still need explicit routes.
     const successors = current.successors.size ? current.successors : new Map([["default", END as Target]]);
     edges[current.name] = {};
@@ -83,7 +103,7 @@ function compile(start: Node): FlowMappings {
       if (target instanceof Node) pending.push(target);
     }
   }
-  return { start: start.name, nodes, edges, nodeMetadata: metadata };
+  return { start: start.name, nodes, edges, nodeMetadata: metadata, checkpoints };
 }
 
 export class Flow {
@@ -91,6 +111,7 @@ export class Flow {
   readonly nodes: Readonly<Record<string, Step>>;
   readonly edges: Edges;
   readonly nodeMetadata: Readonly<Record<string, Record<string, unknown>>>;
+  readonly checkpoints: Readonly<Record<string, CheckpointPolicy>>;
 
   constructor(start: Node | FlowMappings) {
     const mappings = start instanceof Node ? compile(start) : start;
@@ -100,6 +121,7 @@ export class Flow {
       Object.fromEntries(Object.entries(mappings.edges).map(([key, value]) => [key, Object.freeze({ ...value })])),
     );
     this.nodeMetadata = Object.freeze({ ...(mappings.nodeMetadata ?? {}) });
+    this.checkpoints = Object.freeze({ ...(mappings.checkpoints ?? {}) });
     if (!(this.start in this.nodes) || END in this.nodes) throw new Error("Flow needs a valid start node; __end__ is reserved");
     for (const [source, actions] of Object.entries(this.edges)) {
       for (const target of Object.values(actions)) {
@@ -136,9 +158,18 @@ export class Flow {
     return renderGraph(this, filename, options);
   }
 
+  /**
+   * Run from the start node or, when recovering, from the node of the latest
+   * checkpoint in the journal; write a checkpoint before entering a node that
+   * asks for one, or after an applied compaction.
+   */
   async run(runtime: Runtime): Promise<void> {
-    let current = this.start;
+    let current = runtime.resumePoint() ?? this.start;
+    if (!(current in this.nodes)) {
+      throw new NonDeterminismError(runtime.seq, `a checkpoint before node ${JSON.stringify(current)}`, "a flow without that node");
+    }
     while (current !== END) {
+      await runtime.controlPoint(current);
       runtime.step(current, { metadata: this.nodeMetadata[current] });
       let action = await this.nodes[current](runtime);
       if (action === null || action === undefined) action = "default";
@@ -149,6 +180,10 @@ export class Flow {
       }
       runtime.run.emit("transition", { node: current, action, target });
       current = target;
+      if (current !== END) {
+        const policy = this.checkpoints[current] ?? false;
+        if (runtime.checkpointRequested || (typeof policy === "function" ? policy(runtime) : policy)) await runtime.checkpoint(current);
+      }
     }
   }
 }

@@ -9,18 +9,22 @@ import { type Tool, Tools, tool } from "./tools.ts";
 import type { Run } from "./types.ts";
 import { hexId } from "./util.ts";
 
-function continuation(name: string, sessionId: string): string {
-  return `To continue, call ${name}(prompt="...", sessionId="${sessionId}").`;
+/** How the model continues a child session: a call of the delegating tool. */
+export type Continuation = (sessionId: string) => string;
+
+export function continuation(name: string): Continuation {
+  return (sessionId) => `To continue, call ${name}(prompt="...", sessionId="${sessionId}").`;
 }
 
-function runResult(run: Run, name: string): Record<string, unknown> {
+/** @internal What a waiting delegation returns to the model. */
+export function runResult(run: Run, hint: Continuation): Record<string, unknown> {
   return {
     sessionId: run.sessionId,
     runId: run.id,
     status: run.status,
     output: run.output,
     error: run.error,
-    continuation: continuation(name, run.sessionId),
+    continuation: hint(run.sessionId),
   };
 }
 
@@ -56,7 +60,8 @@ class AgentJob {
     readonly sessionId: string,
     readonly parentSessionId: string,
     readonly parentRunId: string,
-    readonly toolName: string,
+    readonly hint: Continuation,
+    readonly extra: Record<string, unknown> = {},
   ) {}
 
   snapshot(): Record<string, unknown> {
@@ -65,8 +70,9 @@ class AgentJob {
       sessionId: this.sessionId,
       parentSessionId: this.parentSessionId,
       parentRunId: this.parentRunId,
+      ...this.extra,
       status: this.status,
-      continuation: continuation(this.toolName, this.sessionId),
+      continuation: this.hint(this.sessionId),
       ...(this.result ?? {}),
     };
   }
@@ -88,7 +94,16 @@ export class AgentJobs {
   start(
     agent: Agent,
     prompt: string,
-    options: { sessionId?: string | null; runtime: Runtime; toolName: string; context: Record<string, unknown> },
+    options: {
+      sessionId?: string | null;
+      runtime: Runtime;
+      toolName: string;
+      context: Record<string, unknown>;
+      /** Overrides the default hint, a call of `toolName` with the child's sessionId. */
+      continuation?: Continuation;
+      /** Extra fields shown in the job's snapshot, such as the agent type. */
+      details?: Record<string, unknown>;
+    },
   ): Record<string, unknown> {
     if (this.closed) throw new Error("AgentJobs is closed");
     const parent = options.runtime.run;
@@ -99,7 +114,8 @@ export class AgentJobs {
     const sessionId = options.sessionId ?? hexId();
     validateSessionId(sessionId);
     if (sessionId === parent.sessionId) throw new Error("A child cannot run in its active parent session");
-    const job = new AgentJob(hexId(), sessionId, parent.sessionId, parent.id, options.toolName);
+    const hint = options.continuation ?? continuation(options.toolName);
+    const job = new AgentJob(hexId(), sessionId, parent.sessionId, parent.id, hint, options.details);
     // If logging fails, do not launch an unacknowledged child.
     parent.emit("agent_job_started", job.snapshot());
     this.jobs.set(job.id, job);
@@ -117,7 +133,7 @@ export class AgentJobs {
       )
       .then(
         (run) => {
-          job.result = runResult(run, job.toolName);
+          job.result = runResult(run, job.hint);
           job.status = run.status;
         },
         (error) => {
@@ -209,7 +225,7 @@ export function agentTool(
         parentRunId: runtime.run.id,
         signal: ctx.signal,
       });
-      return runResult(run, name);
+      return runResult(run, continuation(name));
     },
   });
 }

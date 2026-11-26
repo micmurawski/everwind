@@ -11,6 +11,10 @@ export const SessionSchema = z.strictObject({
   sessionId: z.string(),
   agent: z.string(),
   systemPrompt: z.string(),
+  /** Supervisor text appended to the system prompt for this session (a task frame); fixed once set. */
+  frame: z.string().nullable().default(null),
+  /** The scope of the session's latest run; a continuation without one reuses it. */
+  scope: z.record(z.string(), z.unknown()).nullable().default(null),
   messages: z.array(MessageSchema).default([]),
   logPath: z.string().nullable().default(null),
   status: z.string().default("completed"),

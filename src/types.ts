@@ -128,7 +128,8 @@ export interface Event {
   readonly timestamp: string;
 }
 
-export type RunStatus = "running" | "completed" | "limit" | "timeout" | "failed" | "cancelled";
+/** "frozen": an operator froze it; its stored record stays running, and recover() continues it. */
+export type RunStatus = "running" | "completed" | "limit" | "timeout" | "failed" | "cancelled" | "frozen";
 
 export interface RunInit {
   id?: string;
@@ -138,6 +139,7 @@ export interface RunInit {
   jobId?: string | null;
   messages?: Message[];
   context?: Record<string, unknown>;
+  scope?: JsonObject;
 }
 
 /** Mutable state owned by exactly one execution; context is never logged. */
@@ -149,6 +151,8 @@ export class Run {
   readonly jobId: string | null;
   messages: Message[];
   readonly context: Record<string, unknown>;
+  /** What the run is for, as plain JSON: recorded, so recovery binds the same tools. */
+  readonly scope: JsonObject;
   state: Record<string, unknown> = {};
   readonly events: Event[] = [];
   usage: Record<string, number> = {};
@@ -170,6 +174,7 @@ export class Run {
     this.jobId = init.jobId ?? null;
     this.messages = init.messages ?? [];
     this.context = init.context ?? {};
+    this.scope = clone(init.scope ?? {});
   }
 
   emit(kind: string, data: Record<string, unknown> = {}): void {

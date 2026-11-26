@@ -106,6 +106,15 @@ export class OlderMessages {
 
 export type Selection = MessageRange | OlderHistory | OlderMessages;
 
+/**
+ * A pinned message is never removed by compaction: a task's follow-up, a rule
+ * that must stay in view. Only user messages can be pinned. When a compacted
+ * region holds pinned messages, they are kept, in order, after its replacement.
+ */
+export function isPinned(item: Message): boolean {
+  return item.role === "user" && item.metadata.pinned === true;
+}
+
 export function isSummary(item: Message): boolean {
   const compaction = item.metadata.compaction;
   return (

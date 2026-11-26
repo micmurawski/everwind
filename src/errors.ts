@@ -80,12 +80,16 @@ export class Cancelled extends EverwindError {}
 /** A tool needed a context value the run was not given. */
 export class MissingContext extends EverwindError {}
 
+/** An operator froze the run: it stopped at a step without finishing and stays recoverable. */
+export class Frozen extends EverwindError {}
+
 /**
  * Errors that must never become a tool observation or a failed run: the journal
- * is in an unknown state, so the run stops as it is and stays recoverable.
+ * is in an unknown state (or an operator froze the run), so the run stops as it
+ * is and stays recoverable.
  */
 export function isStopError(error: unknown): boolean {
-  return error instanceof JournalError || error instanceof NonDeterminismError;
+  return error instanceof JournalError || error instanceof NonDeterminismError || error instanceof Frozen;
 }
 
 /** Errors a tool must not swallow: stop errors, a failed session log, missing context. */

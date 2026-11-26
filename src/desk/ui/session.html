@@ -1,0 +1,292 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>everwind desk — session</title>
+<link rel="stylesheet" href="/theme.css">
+<link rel="stylesheet" href="/desk.css">
+</head>
+<body>
+<div class="page">
+  <header class="top">
+    <div style="display: grid; gap: 4px; min-width: 0">
+      <div class="eyebrow">everwind · session</div>
+      <h1 id="title">session</h1>
+      <div class="meta" id="meta"></div>
+    </div>
+    <div class="topright">
+      <div class="stats"></div>
+      <button id="theme" class="theme-toggle" type="button">◐ light</button>
+    </div>
+  </header>
+
+  <div class="row" style="justify-content: space-between">
+    <nav class="tabs" aria-label="Views">
+      <a href="/">projects</a>
+      <a href="/sessions">sessions</a>
+      <a href="/agents">agents</a>
+    </nav>
+    <div class="row" role="toolbar" aria-label="Run controls">
+      <button class="btn warn" type="button" id="hold">❚❚ hold at next step</button>
+      <button class="btn primary" type="button" id="resume">▶ resume</button>
+      <button class="btn" type="button" id="freeze">■ freeze</button>
+      <button class="btn" type="button" id="recover">⟳ recover</button>
+      <button class="btn" type="button" id="replay" title="agent.replay: rebuild the run up to the selected event, without effects">⟲ replay to #—</button>
+      <button class="btn" type="button" id="fork" title="agent.fork: a new session that reuses the run up to the selected event, then runs live">⑂ fork at #—</button>
+    </div>
+  </div>
+
+  <section class="panel" id="flow-panel" hidden>
+    <div class="head"><h2>flow</h2><span class="muted" style="font-size: 0.74rem" id="flow-note"></span></div>
+    <div class="body">
+      <div id="flow"></div>
+      <div class="legend" aria-hidden="true">
+        <span><i style="background: var(--run-soft); border-color: var(--run)"></i>current · running</span>
+        <span><i style="background: var(--ask-soft); border-color: var(--ask)"></i>waiting for you</span>
+        <span><i style="background: var(--warn-soft); border-color: var(--warn)"></i>held · frozen</span>
+        <span><i style="background: var(--wait-soft); border-color: var(--wait)"></i>sleeping</span>
+        <span><i style="border-left: 4px solid var(--good)"></i>visited (×count)</span>
+        <span><i style="border-style: dashed; border-color: var(--dead); background: var(--bg)"></i>not reached</span>
+        <span>drag cards · scroll to zoom · edges show how often they were taken</span>
+      </div>
+    </div>
+  </section>
+
+  <div class="split">
+    <div class="main">
+      <section class="panel">
+        <div class="head"><h2>events</h2>
+          <div class="row">
+            <div class="filters" role="group" aria-label="Event kinds" id="kinds"></div>
+            <label class="muted" style="font-size: 0.74rem; display: inline-flex; gap: 6px; align-items: center"><input type="checkbox" id="follow" checked> follow</label>
+          </div>
+        </div>
+        <div class="log" id="log" aria-live="polite"></div>
+      </section>
+      <section class="panel" id="replay-panel" hidden>
+        <div class="head"><h2>replay</h2><button class="btn small" type="button" id="replay-close">close</button></div>
+        <div class="body" id="replay-body"></div>
+      </section>
+    </div>
+
+    <aside class="side">
+      <section class="panel">
+        <div class="head"><h2>steer</h2><span class="muted" style="font-size: 0.74rem">messages go to the session's inbox</span></div>
+        <div class="body">
+          <div class="chat" id="chat"></div>
+          <div id="question" hidden>
+            <div class="msg q"><div class="who"><b>the agent asks</b><span class="muted">ask_operator</span></div><div class="t" id="question-text"></div></div>
+            <div class="row" id="question-options" style="margin-top: 8px"></div>
+          </div>
+          <label for="draft" class="eyebrow" style="color: var(--muted)" id="draft-label">message · delivered before its next model turn</label>
+          <textarea id="draft" rows="4" placeholder="Write to the agent…"></textarea>
+          <div class="row" style="justify-content: space-between">
+            <label class="muted" style="font-size: 0.74rem; display: inline-flex; gap: 6px; align-items: center"><input type="checkbox" id="pinned"> pin (kept through compaction)</label>
+            <button class="btn primary" type="button" id="send">send ↵</button>
+          </div>
+        </div>
+      </section>
+      <section class="panel">
+        <div class="head"><h2>inbox</h2><span class="muted" style="font-size: 0.74rem">pending first</span></div>
+        <div class="body" id="inbox"></div>
+      </section>
+      <section class="panel">
+        <div class="head"><h2>run</h2></div>
+        <div class="body" id="details"></div>
+      </section>
+    </aside>
+  </div>
+  <footer id="footer">everwind desk · events stream from store.events(session, { after })</footer>
+</div>
+<script src="/theme.js"></script>
+<script type="module">
+import { STATUS, act, ago, api, chip, describe, el, header, kilo, toast } from "/desk.js";
+import { mountFlow } from "/flow.js";
+
+const $ = (id) => document.getElementById(id);
+const id = new URLSearchParams(location.search).get("id");
+const base = `sessions/${encodeURIComponent(id ?? "")}`;
+const KINDS = [["k-model", "model"], ["k-tool", "tools"], ["k-op", "operator"], ["k-ctx", "waits · context"], ["k-sys", "system"]];
+const state = { info: null, summary: null, events: [], open: new Set(), off: new Set(), selected: null };
+
+const seqOf = (stored) => Number(stored.key.split(":")[0]) || 0;
+
+function renderHeader() {
+  const s = state.summary;
+  if (!s) return;
+  $("title").textContent = s.title || s.sessionId;
+  document.title = `everwind desk — ${s.sessionId}`;
+  $("meta").replaceChildren(chip(s.status), el("span", {}, s.sessionId), el("span", {}, el("a", { href: `/agents#${encodeURIComponent(s.agent)}` }, s.agent), s.model ? ` · ${s.model}` : ""), el("span", {}, `run ${s.runId}`), state.info?.scope?.project ? el("span", {}, "task in ", el("a", { href: `/?project=${encodeURIComponent(state.info.scope.project)}&task=${encodeURIComponent(s.sessionId)}` }, state.info.scope.project)) : null, s.parentSessionId ? el("span", {}, "child of ", el("a", { href: `/session?id=${encodeURIComponent(s.parentSessionId)}` }, s.parentSessionId)) : null, el("span", {}, `control: ${s.control}`));
+  header([["", "model calls", s.modelCalls], ["", "tool calls", s.toolCalls], ["", "tokens", kilo(s.tokens)], ["", "runs", s.runs], ["", "last event", ago(s.lastEventAt)]]);
+  const live = ["running", "sleeping", "ask", "held"].includes(s.status);
+  $("hold").disabled = !live || s.control === "hold";
+  $("resume").disabled = !(s.control === "hold" && live);
+  $("freeze").disabled = !live;
+  $("recover").disabled = !["frozen", "stale"].includes(s.status) || !state.info?.agent || state.info?.recovering;
+  const agentKnown = Boolean(state.info?.agent);
+  const seq = state.selected === null ? "—" : state.selected;
+  $("replay").textContent = `⟲ replay to #${seq}`;
+  $("fork").textContent = `⑂ fork at #${seq}`;
+  $("replay").disabled = $("fork").disabled = !agentKnown || state.selected === null;
+  $("question").hidden = s.question === null;
+  $("question-text").textContent = s.question ?? "";
+  const options = [...state.events].reverse().find((e) => e.event.kind === "question")?.event.data.options ?? [];
+  $("question-options").replaceChildren(...(s.question === null ? [] : options.map((o) => el("button", { class: "btn small", type: "button", onclick: () => reply(o) }, o))));
+  $("draft-label").textContent = s.question !== null ? "reply · answers the agent's question" : "message · delivered before its next model turn";
+  $("pinned").disabled = s.question !== null;
+  renderFlow();
+}
+
+// The session's status, as the current node's card shows it.
+const NODE_STATUS = { running: "running", ask: "ask", held: "held", frozen: "held", sleeping: "sleeping", stale: "failed", failed: "failed", timeout: "failed", limit: "failed", cancelled: "failed" };
+let flowView = null;
+
+/** The agent's flow as a graph, painted with the latest run's visits, edge counts and current node. */
+function renderFlow() {
+  const flow = state.info?.agent?.flow;
+  const s = state.summary;
+  if (!flow || !s) return;
+  $("flow-panel").hidden = false;
+  if (flowView === null) flowView = mountFlow($("flow"), flow);
+  const visits = {};
+  const edges = {};
+  for (const { event } of state.events) {
+    if (event.runId !== s.runId) continue;
+    if (event.kind === "step") visits[event.data.node] = (visits[event.data.node] ?? 0) + 1;
+    else if (event.kind === "transition") {
+      const key = `${event.data.node}\u0000${event.data.action}\u0000${event.data.target}`;
+      edges[key] = (edges[key] ?? 0) + 1;
+    }
+  }
+  const nodes = {};
+  for (const [name, n] of Object.entries(visits)) nodes[name] = { status: "visited", sub: `visited ×${n}` };
+  if (s.status === "completed") nodes.__end__ = { status: "success", sub: "completed" };
+  else if (s.node !== null) nodes[s.node] = { status: NODE_STATUS[s.status] ?? "running", sub: `${STATUS[s.status] ?? s.status} · ×${visits[s.node] ?? 0}` };
+  flowView.update({ nodes, edges });
+  $("flow-note").textContent = `${state.info.agent.loop} · run ${s.runId.slice(0, 8)}`;
+}
+
+function renderLog() {
+  const log = $("log");
+  const rows = state.events.filter((stored) => !state.off.has(describe(stored.event)[0] === "k-bad" ? "k-tool" : describe(stored.event)[0]));
+  log.replaceChildren(...(rows.length ? rows.map((stored) => {
+    const [cls, summary] = describe(stored.event);
+    const open = state.open.has(stored.position);
+    const seq = seqOf(stored);
+    return el("div", { class: `lg ${cls}${open ? " open" : ""}` },
+      el("button", { type: "button", "aria-expanded": open, onclick: () => { open ? state.open.delete(stored.position) : state.open.add(stored.position); state.selected = seq; renderLog(); renderHeader(); } },
+        el("span", { class: "muted" }, `#${seq}`), el("span", { class: "muted" }, stored.event.timestamp.slice(11, 19)), el("span", {}, stored.event.kind), el("span", { class: "s" }, summary)),
+      open ? el("pre", {}, JSON.stringify(stored.event.data, null, 2)) : null);
+  }) : [el("div", { class: "empty" }, "no events")]));
+  if ($("follow").checked) log.scrollTop = log.scrollHeight;
+}
+
+function renderChat() {
+  const items = [];
+  for (const { event } of state.events) {
+    const d = event.data;
+    if (event.kind === "run_start") {
+      const prompt = [...(d.messages ?? [])].reverse().find((m) => m.role === "user");
+      if (prompt) items.push(el("div", { class: "msg user" }, el("div", { class: "who" }, el("b", {}, "prompt"), el("span", { class: "muted" }, `run ${event.runId.slice(0, 8)}`)), el("div", { class: "t" }, prompt.content)));
+    } else if (event.kind === "model_response" && d.conversation !== false && d.response?.text) {
+      items.push(el("div", { class: "msg" }, el("div", { class: "who" }, el("b", {}, "agent"), el("span", { class: "muted" }, `turn ${d.turn} · ${event.timestamp.slice(11, 16)}`)), el("div", { class: "t" }, d.response.text)));
+    } else if (event.kind === "instruction") {
+      items.push(el("div", { class: "msg op" }, el("div", { class: "who" }, el("b", {}, d.pinned ? "message · pinned" : "message"), el("span", { class: "muted" }, event.timestamp.slice(11, 16))), el("div", { class: "t" }, d.content)));
+    }
+  }
+  const chat = $("chat");
+  chat.replaceChildren(...(items.length ? items : [el("div", { class: "empty" }, "no conversation yet")]));
+  chat.scrollTop = chat.scrollHeight;
+}
+
+function renderSide() {
+  const info = state.info;
+  if (!info) return;
+  $("inbox").replaceChildren(...(info.inbox.length ? [...info.inbox].sort((a, b) => (a.consumedBy === null) - (b.consumedBy === null) || b.id - a.id).reverse().map((m) =>
+    el("div", { class: "kv", style: "border-bottom: 1px solid var(--sunken); padding-bottom: 4px" },
+      el("span", {}, `#${m.id} ${m.kind}`), el("span", {}, m.consumedBy === null ? el("b", {}, "pending") : `taken by ${m.consumedBy.slice(0, 8)}`),
+      el("span", {}, ago(m.at)), el("span", {}, (m.payload.text ?? JSON.stringify(m.payload)).slice(0, 160)))) : [el("div", { class: "empty" }, "empty")]));
+  $("details").replaceChildren(
+    el("div", { class: "kv" }, ...info.runs.flatMap((r) => [el("span", {}, r.runId.slice(0, 12)), el("span", {}, `${r.status}${r.owner ? ` · owner ${r.owner}` : ""} · epoch ${r.epoch}`)])),
+    info.scope && Object.keys(info.scope).length ? el("div", { class: "box" }, `scope ${JSON.stringify(info.scope, null, 2)}`) : null,
+    info.systemPrompt ? el("details", {}, el("summary", { class: "muted", style: "cursor: pointer" }, "system prompt"), el("div", { class: "box", style: "margin-top: 6px" }, info.systemPrompt)) : null);
+}
+
+async function load() {
+  state.info = await api(base);
+  state.summary = state.info.summary;
+  renderHeader();
+  renderSide();
+}
+
+function connect() {
+  const after = state.events.length ? state.events[state.events.length - 1].position : 0;
+  const source = new EventSource(`/api/${base}/stream?after=${after}`);
+  source.addEventListener("log", (message) => {
+    const stored = JSON.parse(message.data);
+    if (state.events.length && stored.position <= state.events[state.events.length - 1].position) return;
+    state.events.push(stored);
+    scheduleRender();
+  });
+  source.addEventListener("summary", (message) => {
+    state.summary = JSON.parse(message.data);
+    renderHeader();
+    load().catch(() => {});
+  });
+  source.onerror = () => { $("footer").textContent = "everwind desk · reconnecting…"; };
+  source.onopen = () => { $("footer").textContent = "everwind desk · events stream from store.events(session, { after })"; };
+}
+
+let pending = false;
+function scheduleRender() {
+  if (pending) return;
+  pending = true;
+  requestAnimationFrame(() => { pending = false; renderLog(); renderChat(); renderFlow(); });
+}
+
+const control = (stateName, label) => act(async () => { await api(`${base}/control`, { body: { state: stateName } }); await load(); }, label);
+async function reply(text) {
+  await act(() => api(`${base}/reply`, { body: { text } }), "reply sent");
+  $("draft").value = "";
+}
+$("hold").onclick = () => control("hold", "held at the next step");
+$("resume").onclick = () => control("run", "resumed");
+$("freeze").onclick = () => control("freeze", "freezing at the next step");
+$("recover").onclick = () => act(async () => { await api(`${base}/recover`, { body: {} }); await load(); }, "recovering in the desk process");
+$("send").onclick = async () => {
+  const text = $("draft").value.trim();
+  if (!text) return;
+  if (state.summary?.question !== null && state.summary?.question !== undefined) return reply(text);
+  await act(() => api(`${base}/send`, { body: { text, pinned: $("pinned").checked } }), "sent: arrives before the next model turn");
+  $("draft").value = "";
+};
+$("draft").onkeydown = (e) => { if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) $("send").click(); };
+$("replay").onclick = () => act(async () => {
+  const result = await api(`${base}/replay?runId=${encodeURIComponent(state.summary.runId)}&untilSeq=${state.selected}`);
+  $("replay-panel").hidden = false;
+  $("replay-body").replaceChildren(
+    el("div", { class: "kv" }, el("span", {}, "stopped"), el("span", {}, result.reason), el("span", {}, "commands"), el("span", {}, result.commands), el("span", {}, "messages"), el("span", {}, result.messages.length), el("span", {}, "pending tools"), el("span", {}, result.pendingToolCalls.map((c) => c.name).join(", ") || "none")),
+    ...result.messages.slice(-6).map((m) => el("div", { class: `msg${m.role === "user" ? " user" : ""}` }, el("div", { class: "who" }, el("b", {}, m.role), el("span", { class: "muted" }, m.toolCalls?.length ? m.toolCalls.map((c) => c.name).join(", ") : "")), el("div", { class: "t" }, (m.content || "").slice(0, 600)))));
+});
+$("replay-close").onclick = () => { $("replay-panel").hidden = true; };
+$("fork").onclick = () => act(async () => {
+  const result = await api(`${base}/fork`, { body: { runId: state.summary.runId, atSeq: state.selected } });
+  toast(`forked into ${result.sessionId}`);
+  setTimeout(() => { location.href = `/session?id=${encodeURIComponent(result.sessionId)}`; }, 600);
+});
+$("kinds").replaceChildren(...KINDS.map(([cls, label]) => el("button", { type: "button", "aria-pressed": true, onclick: (e) => {
+  state.off.has(cls) ? state.off.delete(cls) : state.off.add(cls);
+  e.currentTarget.setAttribute("aria-pressed", !state.off.has(cls));
+  renderLog();
+} }, label)));
+
+if (!id) {
+  $("title").textContent = "no session";
+  $("log").replaceChildren(el("div", { class: "empty" }, "open a session from the projects or sessions page"));
+} else {
+  load().then(connect).catch((error) => { $("title").textContent = id; toast(error.message, true); });
+}
+</script>
+</body>
+</html>

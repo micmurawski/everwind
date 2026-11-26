@@ -1,0 +1,278 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>everwind desk — projects</title>
+<link rel="stylesheet" href="/theme.css">
+<link rel="stylesheet" href="/desk.css">
+</head>
+<body>
+<div class="page">
+  <header class="top">
+    <div style="display: grid; gap: 4px">
+      <div class="eyebrow">everwind · control desk</div>
+      <h1>projects</h1>
+      <div class="meta" id="meta"><span class="live">live</span></div>
+    </div>
+    <div class="topright">
+      <div class="stats"></div>
+      <button id="theme" class="theme-toggle" type="button">◐ light</button>
+    </div>
+  </header>
+
+  <nav class="tabs" aria-label="Views">
+    <a href="/" aria-current="page">projects</a>
+    <a href="/sessions">sessions</a>
+    <a href="/agents">agents</a>
+  </nav>
+
+  <div class="split">
+    <div class="side" style="flex: 1 1 300px">
+      <section class="panel" aria-label="Projects">
+        <div class="head"><h2>projects</h2><button class="btn small" type="button" id="new">＋ new</button></div>
+        <div class="body">
+          <div class="cards" id="projects"></div>
+        </div>
+      </section>
+    </div>
+
+    <div class="main" id="main">
+      <section class="panel" id="project-head"></section>
+      <div class="split">
+        <section class="panel main" style="flex: 999 1 560px; display: block">
+          <div class="head"><h2>tasks</h2>
+            <div class="legend">
+              <span>◌ ready</span><span>● running</span><span>? needs you</span><span>❚❚ held</span><span>■ frozen</span><span>☾ sleeping</span><span>✓ done</span><span>! failed</span>
+            </div>
+          </div>
+          <div class="scroll">
+            <table class="runs" style="min-width: 46rem">
+              <thead><tr><th>task</th><th>agent</th><th>status</th><th>runs</th><th>tokens</th><th>result</th></tr></thead>
+              <tbody id="tasks"></tbody>
+            </table>
+          </div>
+        </section>
+        <aside class="panel side" style="flex: 1 1 340px; display: block" id="task-panel"></aside>
+      </div>
+    </div>
+  </div>
+  <dialog class="dialog" id="dialog" aria-labelledby="dialog-title">
+    <form class="form" id="form" method="dialog">
+      <div class="head"><h2 id="dialog-title">new project</h2><button class="btn small" type="button" id="cancel-form" aria-label="Close">✕</button></div>
+      <div class="body">
+        <label>title <input type="text" name="title" required autofocus></label>
+        <label>goal (the root task's prompt) <textarea name="goal" rows="4" required></textarea></label>
+        <label>root agent <select name="agent" id="agent-select" required></select></label>
+        <fieldset class="agents-pick">
+          <legend>agents its tasks may use</legend>
+          <div class="chips" id="agents-pick"></div>
+          <div class="sub">none ticked: the root agent only</div>
+        </fieldset>
+        <div class="pair">
+          <label>max depth <input type="number" name="maxDepth" value="3" min="0" max="10"></label>
+          <label>max tasks <input type="number" name="maxTasks" value="100" min="1"></label>
+          <label>token budget <input type="number" name="budgetTokens" placeholder="none" min="1"></label>
+        </div>
+        <div class="error-line" id="form-error" hidden></div>
+        <div class="row" style="justify-content: space-between">
+          <span class="sub">A supervisor running these agents picks it up; the desk writes it to the store.</span>
+          <div class="row"><button class="btn" type="button" id="cancel-form-2">cancel</button><button class="btn primary" type="submit">create</button></div>
+        </div>
+      </div>
+    </form>
+  </dialog>
+  <footer>projects and tasks live in the store · a Supervisor runs them · controls apply at each task's next step</footer>
+</div>
+<script src="/theme.js"></script>
+<script type="module">
+import { STATUS, act, api, chip, el, header, kilo, toast } from "/desk.js";
+
+const $ = (id) => document.getElementById(id);
+const params = new URLSearchParams(location.search);
+const state = { projects: [], current: params.get("project"), view: null, selected: params.get("task"), agents: [] };
+const LIVE = ["running", "ask", "held", "sleeping"];
+
+function remember() {
+  const query = new URLSearchParams();
+  if (state.current) query.set("project", state.current);
+  if (state.selected) query.set("task", state.selected);
+  history.replaceState(null, "", `/?${query}`);
+}
+
+function renderProjects() {
+  const all = state.projects;
+  const sum = (key) => all.reduce((n, p) => n + (p.counts[key] ?? 0), 0);
+  header([["running", "active projects", all.filter((p) => p.status === "active").length], ["running", "running tasks", sum("running") + sum("sleeping")], ["ask", "needs you", sum("ask")], ["failed", "failed tasks", sum("failed") + sum("stale")], ["", "tokens", kilo(all.reduce((n, p) => n + p.spentTokens, 0))]]);
+  $("meta").replaceChildren(el("span", { class: "live" }, "live"), el("span", {}, `${all.length} projects`), el("span", {}, `${all.reduce((n, p) => n + p.taskCount, 0)} tasks`));
+  if (!all.length) {
+    $("projects").replaceChildren(el("div", { class: "empty" }, "no projects yet: create one"));
+    return;
+  }
+  if (!all.some((p) => p.id === state.current)) state.current = all[0].id;
+  $("projects").replaceChildren(...all.map((p) => {
+    const pct = p.budgetTokens ? Math.min(100, Math.round((p.spentTokens / p.budgetTokens) * 100)) : 0;
+    const badges = Object.entries(p.counts).sort().map(([k, n]) => el("span", { class: `chip ${k}` }, `${n} ${STATUS[k]?.replace(/^\S+ /, "") ?? k}`));
+    return el("button", { class: "card", type: "button", "aria-pressed": p.id === state.current, onclick: () => { state.current = p.id; state.selected = null; remember(); load(); } },
+      el("span", { class: "row", style: "justify-content: space-between" }, el("b", {}, p.title), chip(p.status)),
+      el("span", { class: "sub" }, p.goal.slice(0, 120)),
+      el("span", { class: "chips" }, ...badges),
+      el("span", { class: "sub" }, `${kilo(p.spentTokens)} tokens${p.budgetTokens ? ` of ${kilo(p.budgetTokens)}` : ""}`),
+      p.budgetTokens ? el("span", { class: "bar" }, el("i", { class: pct >= 90 ? "over" : pct >= 75 ? "hot" : "", style: `width: ${pct}%` })) : null);
+  }));
+}
+
+function renderProject() {
+  const p = state.view;
+  if (!p) return;
+  const controls = [];
+  if (p.status === "active") controls.push(el("button", { class: "btn warn", type: "button", onclick: () => setStatus("paused") }, "❚❚ stop admitting"));
+  if (p.status === "paused") controls.push(el("button", { class: "btn primary", type: "button", onclick: () => setStatus("active") }, "▶ resume project"));
+  if (["active", "paused"].includes(p.status)) controls.push(el("button", { class: "btn bad", type: "button", onclick: () => cancel(p.rootTask, "the whole project") }, "✕ cancel project"));
+  controls.push(el("a", { class: "btn", href: `/sessions?project=${encodeURIComponent(p.id)}` }, "⌕ its sessions"));
+  $("project-head").replaceChildren(
+    el("div", { class: "head", style: "padding: 12px 14px" },
+      el("div", { style: "display: grid; gap: 2px; min-width: 0" },
+        el("div", { class: "eyebrow" }, "project"),
+        el("h2", { style: "font-size: 1.05rem; text-transform: none; letter-spacing: -0.01em" }, p.title),
+        el("div", { class: "meta" }, chip(p.status), el("span", {}, p.id), el("span", {}, `depth ≤ ${p.maxDepth}`), el("span", {}, `${p.taskCount} / ${p.maxTasks} tasks`), el("span", {}, `agents: ${p.agents.join(", ")}`), p.reason ? el("span", {}, p.reason) : null)),
+      el("div", { class: "row" }, ...controls)),
+    el("div", { class: "body" },
+      el("div", { class: "kv" }, el("span", {}, "goal"), el("span", {}, p.goal), el("span", {}, "tokens"), el("span", {}, `${kilo(p.spentTokens)}${p.budgetTokens ? ` of ${kilo(p.budgetTokens)}` : ""}`), p.result ? el("span", {}, "result") : null, p.result ? el("span", {}, p.result) : null)));
+  // Tree order: parents before children, with ├─ └─ glyphs.
+  const byParent = new Map();
+  for (const t of p.tasks) byParent.set(t.parent, [...(byParent.get(t.parent) ?? []), t]);
+  const rows = [];
+  const walk = (t, prefix, last) => {
+    rows.push({ t, glyph: t.depth === 0 ? "" : `${prefix}${last ? "└─ " : "├─ "}` });
+    const kids = byParent.get(t.id) ?? [];
+    kids.forEach((kid, i) => walk(kid, t.depth === 0 ? "" : `${prefix}${last ? "   " : "│  "}`, i === kids.length - 1));
+  };
+  const root = p.tasks.find((t) => t.parent === null);
+  if (root) walk(root, "", true);
+  if (!state.selected || !p.tasks.some((t) => t.id === state.selected)) state.selected = (p.tasks.find((t) => t.display === "ask") ?? root)?.id ?? null;
+  $("tasks").replaceChildren(...rows.map(({ t, glyph }) => {
+    const flag = t.summary?.flag ?? (t.status === "failed" ? t.error : null);
+    return el("tr", { class: t.id === state.selected ? "selected" : "" },
+      el("td", {}, el("span", { class: "tree" }, glyph),
+        el("button", { type: "button", style: "font: inherit; font-weight: 700; color: var(--fg); background: none; border: 0; padding: 0; cursor: pointer; text-align: left", "aria-pressed": t.id === state.selected, onclick: () => { state.selected = t.id; remember(); renderProject(); } }, t.title),
+        el("div", { class: "sub", style: "margin-left: 3ch" }, t.id),
+        flag ? el("div", { class: `flag${t.display === "ask" ? " ask" : ""}`, style: "margin-left: 3ch" }, `⚑ ${flag}`) : null),
+      el("td", {}, el("a", { class: "chip kind", href: `/agents#${encodeURIComponent(t.agent)}`, style: "text-decoration: none" }, t.agent)),
+      el("td", {}, chip(t.display), t.followUps.length ? el("div", { class: "sub" }, `${t.followUps.length} follow-up queued`) : null),
+      el("td", { class: "num" }, t.activations),
+      el("td", { class: "num" }, kilo(t.spentTokens)),
+      el("td", { class: "sub", style: "max-width: 22rem" }, (t.result ?? t.error ?? "").slice(0, 160)));
+  }));
+  renderTask();
+}
+
+function renderTask() {
+  const t = state.view?.tasks.find((x) => x.id === state.selected);
+  if (!t) {
+    $("task-panel").replaceChildren(el("div", { class: "head" }, el("h2", {}, "task")), el("div", { class: "body" }, el("div", { class: "empty" }, "select a task")));
+    return;
+  }
+  const kids = state.view.tasks.filter((x) => x.parent === t.id);
+  const live = LIVE.includes(t.display);
+  const open = ["ready", "running"].includes(t.status);
+  const draft = el("textarea", { rows: 3, id: "draft", placeholder: t.display === "ask" ? "Answer its question…" : live ? "A message, before its next model turn…" : "A follow-up: runs the task again on its session…" });
+  const send = () => {
+    const text = draft.value.trim();
+    if (!text) return;
+    const path = t.display === "ask" ? `sessions/${encodeURIComponent(t.id)}/reply` : `tasks/${encodeURIComponent(t.id)}/followup`;
+    act(async () => { const result = await api(path, { body: { text } }); draft.value = ""; await load(); return result; }, t.display === "ask" ? "answered" : live ? "sent to the running task" : "follow-up queued: the task runs again");
+  };
+  const control = (stateName, label) => act(async () => { await api(`sessions/${encodeURIComponent(t.id)}/control`, { body: { state: stateName } }); await load(); }, label);
+  $("task-panel").replaceChildren(
+    el("div", { class: "head" }, el("h2", {}, `task · ${t.agent}`), chip(t.display)),
+    el("div", { class: "body" },
+      el("b", {}, t.title),
+      t.summary?.question ? el("div", { class: "msg q" }, el("div", { class: "who" }, el("b", {}, "the agent asks"), el("span", { class: "muted" }, "ask_operator")), el("div", { class: "t" }, t.summary.question)) : null,
+      el("div", {}, el("div", { class: "eyebrow", style: "color: var(--muted)" }, "prompt"), el("div", { class: "box", style: "margin-top: 3px; max-height: 10em; overflow: auto" }, t.prompt)),
+      t.result || t.error ? el("div", {}, el("div", { class: "eyebrow", style: "color: var(--muted)" }, t.result ? "result" : "error"), el("div", { class: "box", style: "margin-top: 3px; max-height: 14em; overflow: auto" }, t.result ?? t.error)) : null,
+      el("div", { class: "kv" },
+        el("span", {}, "id"), el("span", {}, t.id),
+        el("span", {}, "depth"), el("span", {}, t.depth),
+        el("span", {}, "parent"), el("span", {}, t.parent ?? "— (root)"),
+        el("span", {}, "context"), el("span", {}, t.forked ? "forked from its parent" : t.context),
+        el("span", {}, "activations"), el("span", {}, t.activations),
+        el("span", {}, "children"), el("span", {}, kids.length ? kids.map((k) => `${k.title} (${STATUS[k.display] ?? k.display})`).join(", ") : "none"),
+        t.followUps.length ? el("span", {}, "queued") : null, t.followUps.length ? el("span", {}, t.followUps.map((f) => f.text).join(" · ")) : null),
+      el("div", { class: "row" },
+        t.activations ? el("a", { class: "btn", href: `/session?id=${encodeURIComponent(t.id)}` }, "⌕ open session") : null,
+        live && t.summary?.control !== "hold" ? el("button", { class: "btn warn", type: "button", onclick: () => control("hold", "held at the next step") }, "❚❚ hold") : null,
+        t.summary?.control === "hold" ? el("button", { class: "btn primary", type: "button", onclick: () => control("run", "resumed") }, "▶ resume") : null,
+        live ? el("button", { class: "btn", type: "button", onclick: () => control("freeze", "freezing at the next step") }, "■ freeze") : null,
+        t.display === "frozen" || t.display === "stale" ? el("button", { class: "btn", type: "button", onclick: () => act(async () => { await api(`sessions/${encodeURIComponent(t.id)}/recover`, { body: {} }); await load(); }, "recovering") }, "⟳ recover") : null,
+        open ? el("button", { class: "btn bad", type: "button", onclick: () => cancel(t.id, "this task and its subtasks") }, "✕ cancel") : null),
+      t.status !== "cancelled" ? el("label", { for: "draft", class: "eyebrow", style: "color: var(--muted)" }, t.display === "ask" ? "reply" : live ? "message (pinned)" : "follow-up (pinned)") : null,
+      t.status !== "cancelled" ? draft : null,
+      t.status !== "cancelled" ? el("div", { class: "row", style: "justify-content: flex-end" }, el("button", { class: "btn primary", type: "button", onclick: send }, t.display === "ask" ? "answer ↵" : "send ↵")) : null));
+}
+
+async function setStatus(status) {
+  await act(async () => { await api(`projects/${encodeURIComponent(state.current)}/status`, { body: { status } }); await load(); }, status === "paused" ? "no new tasks start; running ones go on" : "resumed");
+}
+async function cancel(id, what) {
+  if (!confirm(`Cancel ${what}? Running tasks are frozen and their parents are told.`)) return;
+  await act(async () => { await api(`tasks/${encodeURIComponent(id)}/cancel`, { body: {} }); await load(); }, "cancelled");
+}
+
+async function load() {
+  try {
+    state.projects = await api("projects");
+    renderProjects();
+    if (state.current) {
+      state.view = await api(`projects/${encodeURIComponent(state.current)}`);
+      renderProject();
+    }
+  } catch (error) {
+    $("meta").replaceChildren(el("span", { class: "down" }, `! desk unreachable: ${error.message}`));
+  }
+}
+
+async function loadAgents() {
+  try {
+    state.agents = (await api("overview")).agents;
+  } catch {}
+  $("agent-select").replaceChildren(...state.agents.map((name) => el("option", { value: name }, name)));
+  $("agents-pick").replaceChildren(...(state.agents.length
+    ? state.agents.map((name) => el("label", { class: "chip", style: "display: inline-flex; gap: 5px; align-items: center; cursor: pointer; padding: 2px 8px" }, el("input", { type: "checkbox", value: name }), name))
+    : [el("span", { class: "sub" }, "no agents registered with the desk")]));
+}
+
+const dialog = $("dialog");
+$("new").onclick = async () => {
+  await loadAgents();
+  $("form-error").hidden = true;
+  dialog.showModal();
+};
+for (const id of ["cancel-form", "cancel-form-2"]) $(id).onclick = () => dialog.close();
+// A click on the backdrop (outside the form) closes it too.
+dialog.addEventListener("click", (event) => { if (event.target === dialog) dialog.close(); });
+$("form").onsubmit = async (event) => {
+  event.preventDefault();
+  const data = Object.fromEntries(new FormData($("form")));
+  const agents = [...document.querySelectorAll("#agents-pick input:checked")].map((box) => box.value);
+  try {
+    const created = await api("projects", { body: { ...data, agents } });
+    $("form").reset();
+    dialog.close();
+    state.current = created.id;
+    state.selected = null;
+    remember();
+    toast("project created: a supervisor picks it up");
+    await load();
+  } catch (error) {
+    // Keep the dialog open with what was typed, and say what is wrong.
+    $("form-error").textContent = error.message;
+    $("form-error").hidden = false;
+  }
+};
+// Keep the draft while the page refreshes: only re-render when the user is not typing.
+setInterval(() => { if (document.activeElement?.id !== "draft" && !dialog.open) load(); }, 2000);
+load();
+</script>
+</body>
+</html>

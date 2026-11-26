@@ -5,6 +5,7 @@ import {
   Cancelled,
   ConfigurationChanged,
   DeadlineExceeded,
+  Frozen,
   LimitReached,
   ReplayExhausted,
   SessionLogError,
@@ -21,6 +22,8 @@ import {
   type RunRecord,
   runRecord,
 } from "./journal.ts";
+import { MESSAGE } from "./inbox.ts";
+import { REPLY } from "./operator.ts";
 import { type Loop, ReAct } from "./loops.ts";
 import { type Provider, providerModel, providerName } from "./providers/base.ts";
 import { Runtime } from "./runtime.ts";
@@ -149,6 +152,23 @@ export interface AgentOptions {
 
 export interface RunOptions {
   context?: Record<string, unknown>;
+  /**
+   * What this run is for, as plain JSON (a task's id, depth, allowed agents…).
+   * Tools bind to it (Tool `available`, scoped `input`), and it is recorded, so
+   * recovery and replay bind the same tools. A continuation without one reuses
+   * the session's latest scope.
+   */
+  scope?: JsonObject;
+  /**
+   * Text a supervisor appends to the agent's system prompt for this session,
+   * such as a task frame. It is fixed for the session: set it on the first run;
+   * a continuation may omit it or must repeat it exactly.
+   */
+  frame?: string;
+  /** Pin the prompt: compaction never removes it (see pinned messages). */
+  pin?: boolean;
+  /** The new run's id (default: a fresh one), so a caller can record it before the run starts. */
+  runId?: string;
   history?: readonly MessageInput[];
   logDir?: string;
   sessionId?: string;
@@ -180,6 +200,8 @@ export class Agent {
   readonly leaseTtl: number;
   readonly shared: SharedWorld | null;
   private readonly options: AgentOptions;
+  /** run id -> the session frame its system prompt was built with. */
+  private readonly frames = new Map<string, string | null>();
 
   constructor(options: AgentOptions) {
     this.options = options;
@@ -243,23 +265,30 @@ export class Agent {
         if (previous.agent !== this.name || previous.systemPrompt !== this.systemPrompt) {
           throw new Error("Session belongs to a different agent configuration");
         }
+        if (options.frame !== undefined && options.frame !== (previous.frame ?? undefined)) {
+          throw new Error("A session's frame is fixed: omit it, or pass the same frame, to continue");
+        }
         // With a store, interrupted runs are found in the journal, not the checkpoint.
         if (previous.status === "running" && this.store === null) {
           throw new Error("Session was interrupted before checkpointing; inspect it before recovery");
         }
       }
+      const frame = options.frame ?? previous?.frame ?? null;
       const run = new Run({
+        id: options.runId,
         sessionId,
         parentSessionId: options.parentSessionId ?? null,
         parentRunId: options.parentRunId ?? null,
         jobId: options.jobId ?? null,
         context: { ...(options.context ?? {}) },
+        scope: options.scope ?? (previous?.scope as JsonObject | null) ?? {},
         messages: [
-          message({ role: "system", content: this.systemPrompt }),
+          message({ role: "system", content: this.promptWith(frame) }),
           ...clone(previous?.messages ?? history),
-          message({ role: "user", content: prompt }),
+          message({ role: "user", content: prompt, metadata: options.pin ? { pinned: true } : {} }),
         ],
       });
+      this.frames.set(run.id, frame);
       let directory = options.logDir ?? this.logDir;
       if (previous?.logPath) {
         const previousDirectory = resolve(previous.logPath, "..");
@@ -270,6 +299,48 @@ export class Agent {
       }
       return this.execute(run, { directory, resumeLog: Boolean(previous?.logPath), signal: options.signal });
     });
+  }
+
+  /**
+   * Send a message to a session ("send now"): its agent reads it before the
+   * next model turn, and a suspended run of the session wakes for it. Needs a
+   * durable store; the message waits in the inbox if no run is active.
+   */
+  send(sessionId: string, text: string, options: { from?: string; kind?: string } = {}): Promise<number> {
+    if (this.store === null) throw new Error("send() requires an Agent with a durable store");
+    if (typeof text !== "string" || !text) throw new Error("A message needs text");
+    const payload: JsonObject = { text, ...(options.from ? { from: options.from } : {}) };
+    return this.store.signal(sessionId, options.kind ?? MESSAGE, payload);
+  }
+
+  /** Answer the question the session's agent asked with ask_operator. */
+  reply(sessionId: string, text: string): Promise<number> {
+    if (typeof text !== "string" || !text) throw new Error("A reply needs text");
+    return this.requireStore("reply").signal(sessionId, REPLY, { text });
+  }
+
+  /** Hold the session's runs at their next step (the timeout clock stops); resume() lets them go on. */
+  hold(sessionId: string, note?: string): Promise<void> {
+    return this.requireStore("hold").setControl(sessionId, "hold", note ?? null);
+  }
+
+  /** Let a held session go on. A frozen one is resumed with recover() instead. */
+  resume(sessionId: string): Promise<void> {
+    return this.requireStore("resume").setControl(sessionId, "run");
+  }
+
+  /**
+   * Freeze the session's run: it stops at its next step (or at once while
+   * suspended), writes a checkpoint and releases its lease. agent.run() then
+   * returns the run with status "frozen"; recover() continues it later.
+   */
+  freeze(sessionId: string, note?: string): Promise<void> {
+    return this.requireStore("freeze").setControl(sessionId, "freeze", note ?? null);
+  }
+
+  private requireStore(action: string): DurableStore {
+    if (this.store === null) throw new Error(`${action}() requires an Agent with a durable store`);
+    return this.store;
   }
 
   /**
@@ -297,7 +368,9 @@ export class Agent {
       if (!interrupted.length) throw new Error(`Session ${sessionId} has no interrupted run`);
       const record = interrupted[0];
       const start = record.start;
-      if (record.agent !== this.name || start.systemPrompt !== this.systemPrompt) {
+      // Recovering is how a frozen session resumes.
+      if (store.control(sessionId)?.state === "freeze") await store.setControl(sessionId, "run");
+      if (record.agent !== this.name || start.systemPrompt !== this.promptWith((start.frame as string | null) ?? null)) {
         throw new Error("Run belongs to a different agent configuration");
       }
       const changed = changedParts(start, fingerprint(this));
@@ -339,12 +412,13 @@ export class Agent {
     const record = store.getRun(sessionId, runId);
     if (record === null) throw new Error(`Run ${runId} not found in session ${sessionId}`);
     const run = this.runFromRecord(record, options.context);
+    this.frames.delete(run.id); // Only execute() reads it; a replay writes no record.
     const journal = new RunJournal(null, sessionId, runId, record.epoch, store.journal(sessionId, runId), {
       readonly: true,
       untilSeq: options.untilSeq ?? null,
       lenientUntil: lenientUntil(record.start),
     });
-    const runtime = new Runtime(run, this.provider, this.tools, this.limits, { journal, shared: this.shared });
+    const runtime = new Runtime(run, this.provider, this.tools.bind(run.scope), this.limits, { journal, shared: this.shared });
     let reason: Replay["reason"] = "finished";
     try {
       await this.loop.run(runtime);
@@ -389,8 +463,15 @@ export class Agent {
         throw new Error(`Session ${newSessionId} already exists`);
       }
       const recorded = (source.start.messages as unknown as MessageInput[]).map((item) => message(item));
-      if (recorded.length && recorded[0].role === "system") recorded[0] = message({ role: "system", content: this.systemPrompt });
-      const run = new Run({ sessionId: newSessionId, context: { ...(options.context ?? {}) }, messages: recorded });
+      const frame = (source.start.frame as string | null | undefined) ?? null;
+      if (recorded.length && recorded[0].role === "system") recorded[0] = message({ role: "system", content: this.promptWith(frame) });
+      const run = new Run({
+        sessionId: newSessionId,
+        context: { ...(options.context ?? {}) },
+        scope: (source.start.scope as JsonObject | undefined) ?? {},
+        messages: recorded,
+      });
+      this.frames.set(run.id, frame);
       await store.createRun(
         runRecord({
           sessionId: run.sessionId,
@@ -413,9 +494,20 @@ export class Agent {
     });
   }
 
+  /** The system prompt with a session's frame appended. */
+  private promptWith(frame: string | null): string {
+    return frame ? `${this.systemPrompt}\n\n${frame}` : this.systemPrompt;
+  }
+
+  private frameOf(run: Run): string | null {
+    return this.frames.get(run.id) ?? null;
+  }
+
   private startRecord(run: Run): JsonObject {
     return clone({
-      systemPrompt: this.systemPrompt,
+      systemPrompt: this.promptWith(this.frameOf(run)),
+      frame: this.frameOf(run),
+      scope: run.scope,
       messages: run.messages,
       limits: this.limits,
       loop: this.loop.constructor?.name ?? "Loop",
@@ -428,15 +520,18 @@ export class Agent {
 
   private runFromRecord(record: RunRecord, context?: Record<string, unknown>): Run {
     const start = record.start;
-    return new Run({
+    const run = new Run({
       id: record.runId,
       sessionId: record.sessionId,
       parentSessionId: (start.parentSessionId as string | null) ?? null,
       parentRunId: (start.parentRunId as string | null) ?? null,
       jobId: (start.jobId as string | null) ?? null,
       context: { ...(context ?? {}) },
+      scope: (start.scope as JsonObject | undefined) ?? {},
       messages: (start.messages as unknown as MessageInput[]).map((item) => message(item)),
     });
+    this.frames.set(run.id, (start.frame as string | null | undefined) ?? null);
+    return run;
   }
 
   private session(run: Run, status: string): Session {
@@ -444,6 +539,8 @@ export class Agent {
       sessionId: run.sessionId,
       agent: this.name,
       systemPrompt: this.systemPrompt,
+      frame: this.frameOf(run),
+      scope: run.scope,
       messages: checkpointMessages(run),
       status,
       logPath: run.logPath,
@@ -472,6 +569,7 @@ export class Agent {
     let runtime: Runtime | null = null;
     let sessionLog: SessionLog | null = null;
     let stopped = false; // The journal must not be finished or checkpointed by this owner.
+    let frozen = false;
     let rethrow: unknown = null;
     if (options.directory !== null) {
       // Opened before anything else: a log that cannot be created fails the run before any effect.
@@ -482,7 +580,11 @@ export class Agent {
     }
     const activeBefore = recovery?.activeSeconds ?? 0;
     const started = performance.now();
-    const active = () => activeBefore + (performance.now() - started) / 1000;
+    // Time spent in a durable timer (runtime.sleep) is not active time.
+    let pausedMs = 0;
+    let pausedAt: number | null = null;
+    const active = () =>
+      activeBefore + (performance.now() - started - pausedMs - (pausedAt === null ? 0 : performance.now() - pausedAt)) / 1000;
     const controller = childController();
     const onCancel = () => controller.abort(new Cancelled("Run cancelled by caller"));
     if (options.signal?.aborted) onCancel();
@@ -491,7 +593,22 @@ export class Agent {
     const remaining = this.limits.timeout - activeBefore;
     const expire = () => controller.abort(new DeadlineExceeded("Run deadline exceeded"));
     if (remaining <= 0) expire();
-    const deadline = setTimeout(expire, Math.max(remaining, 0) * 1000);
+    let deadline = setTimeout(expire, Math.max(remaining, 0) * 1000);
+    const clock = {
+      pause: () => {
+        if (pausedAt !== null) return;
+        pausedAt = performance.now();
+        clearTimeout(deadline);
+      },
+      resume: () => {
+        if (pausedAt === null) return;
+        pausedMs += performance.now() - pausedAt;
+        pausedAt = null;
+        const left = this.limits.timeout - active();
+        if (left <= 0) expire();
+        else deadline = setTimeout(expire, left * 1000);
+      },
+    };
     const heartbeat = new AbortController();
 
     try {
@@ -520,11 +637,12 @@ export class Agent {
         // Without a journal, a "running" checkpoint is how a crash is detected later.
         await this.checkpoint(run, "running");
       }
-      runtime = new Runtime(run, this.provider, this.tools, this.limits, {
+      runtime = new Runtime(run, this.provider, this.tools.bind(run.scope), this.limits, {
         journal,
         shared: this.shared,
         liveEvent: recovery?.liveEvent ?? null,
         signal: controller.signal,
+        clock,
       });
       run.emit("run_start", {
         agent: this.name,
@@ -545,7 +663,11 @@ export class Agent {
       await abortable(looping, controller.signal);
       if (run.status === "running") throw new Error("Loop ended without runtime.finish(output)");
     } catch (error) {
-      if (isStopError(error)) {
+      if (error instanceof Frozen) {
+        stopped = true;
+        frozen = true;
+        [run.status, run.error] = ["frozen", null];
+      } else if (isStopError(error)) {
         stopped = true;
         [run.status, run.error] = ["failed", describeError(error)];
         rethrow = error;
@@ -574,6 +696,8 @@ export class Agent {
       if (run.status !== "completed") run.output = null;
       if (stopped) {
         run.eventSink = null;
+        // Frozen: hand the run back without finishing it, so recover() needs no force.
+        if (frozen && journal !== null) await (store as DurableStore).releaseRun(run.sessionId, run.id, journal.epoch);
       } else {
         try {
           runtime?.goLive();
@@ -604,6 +728,7 @@ export class Agent {
       }
     } finally {
       sessionLog?.close();
+      this.frames.delete(run.id);
     }
     if (rethrow !== null) throw rethrow;
     return run;
@@ -657,8 +782,14 @@ export class Worker {
    * On a single host, `force: true` at startup is safe: no other process can own
    * these runs, so there is no need to wait for their leases to expire.
    */
-  async recoverAll(options: { force?: boolean; allowFingerprintChange?: boolean } = {}): Promise<(Run | Error)[]> {
-    const records = this.store.runs({ status: "running" });
+  async recoverAll(
+    options: { force?: boolean; allowFingerprintChange?: boolean; includeFrozen?: boolean } = {},
+  ): Promise<(Run | Error)[]> {
+    const { includeFrozen = false, ...recoverOptions } = options;
+    // A frozen session stays frozen until someone recovers it on purpose.
+    const records = this.store
+      .runs({ status: "running" })
+      .filter((record) => includeFrozen || this.store.control(record.sessionId)?.state !== "freeze");
     const limit = this.options.concurrency ?? 50;
     const results: (Run | Error)[] = new Array(records.length);
     let next = 0;
@@ -670,7 +801,7 @@ export class Worker {
           const agent = this.agents.get(record.agent);
           if (agent === undefined) throw new Error(`No agent named ${JSON.stringify(record.agent)} for run ${record.runId}`);
           const context = typeof this.options.context === "function" ? this.options.context(record) : this.options.context;
-          results[index] = await agent.recover(record.sessionId, { context, ...options });
+          results[index] = await agent.recover(record.sessionId, { context, ...recoverOptions });
         } catch (error) {
           results[index] = error instanceof Error ? error : new Error(String(error));
         }

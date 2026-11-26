@@ -33,6 +33,11 @@
       "bun": "./dist/python/index.js",
       "import": "./dist/python/index.js"
     },
+    "./desk": {
+      "types": "./dist/desk/index.d.ts",
+      "bun": "./dist/desk/index.js",
+      "import": "./dist/desk/index.js"
+    },
     "./package.json": "./package.json"
   },
   "files": [

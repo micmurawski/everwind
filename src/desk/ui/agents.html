@@ -1,0 +1,109 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>everwind desk — agents</title>
+<link rel="stylesheet" href="/theme.css">
+<link rel="stylesheet" href="/desk.css">
+</head>
+<body>
+<div class="page">
+  <header class="top">
+    <div style="display: grid; gap: 4px">
+      <div class="eyebrow">everwind · control desk</div>
+      <h1>agents</h1>
+      <div class="meta" id="meta"></div>
+    </div>
+    <div class="topright">
+      <div class="stats"></div>
+      <button id="theme" class="theme-toggle" type="button">◐ light</button>
+    </div>
+  </header>
+
+  <nav class="tabs" aria-label="Views">
+    <a href="/">projects</a>
+    <a href="/sessions">sessions</a>
+    <a href="/agents" aria-current="page">agents</a>
+  </nav>
+
+  <div class="split">
+    <section class="panel side" style="flex: 1 1 280px; display: block" aria-label="Registered agents">
+      <div class="head"><h2>registry</h2></div>
+      <div class="body"><div class="cards" id="cards"></div></div>
+    </section>
+    <div class="main" id="detail"></div>
+  </div>
+  <footer>agents come from serveDesk({ agents }); runs of other agents still show under sessions</footer>
+</div>
+<script src="/theme.js"></script>
+<script type="module">
+import { GROUPS, api, chip, el, header, kilo, ago } from "/desk.js";
+import { mountFlow } from "/flow.js";
+
+const $ = (id) => document.getElementById(id);
+let agents = [];
+let current = decodeURIComponent(location.hash.slice(1));
+let promptOpen = false;
+
+// One graph per agent, kept across the 3-second refreshes so its pan, zoom and card positions stay.
+const graphs = new Map();
+function graphBox(agent) {
+  if (!agent.flow) return [el("span", { class: "muted" }, "not a Flow: its loop is plain code"), false];
+  const known = graphs.get(agent.name);
+  if (known) return [known, false];
+  const box = el("div");
+  graphs.set(agent.name, box);
+  return [box, true];
+}
+
+function render() {
+  const live = (a) => a.sessions.filter((s) => !GROUPS.done.includes(s.status) && !["failed", "timeout", "limit"].includes(s.status));
+  header([["", "agents", agents.length], ["running", "live sessions", agents.reduce((n, a) => n + live(a).length, 0)], ["ask", "needs you", agents.reduce((n, a) => n + a.sessions.filter((s) => s.status === "ask").length, 0)]]);
+  $("meta").replaceChildren(el("span", {}, `${agents.length} registered`));
+  if (!agents.length) {
+    $("cards").replaceChildren(el("div", { class: "empty" }, "no agents registered with the desk"));
+    $("detail").replaceChildren();
+    return;
+  }
+  if (!agents.some((a) => a.name === current)) current = agents[0].name;
+  $("cards").replaceChildren(...agents.map((a) => el("button", { class: "card", type: "button", "aria-pressed": a.name === current, onclick: () => { current = a.name; location.hash = encodeURIComponent(a.name); render(); } },
+    el("b", {}, a.name), el("span", { class: "sub" }, `${a.model ?? a.provider} · ${a.loop}`),
+    el("span", { class: "irow" }, el("span", { class: "ib running" }, `${live(a).length} live`), el("span", { class: "ib" }, `${a.sessions.length} sessions`), el("span", { class: "ib" }, `${a.tools.length} tools`)))));
+  const a = agents.find((x) => x.name === current);
+  const tools = el("table", { class: "runs", style: "min-width: 36rem" },
+    el("thead", {}, el("tr", {}, el("th", {}, "tool"), el("th", {}, "effect"), el("th", {}, "what it does"))),
+    el("tbody", {}, ...a.tools.map((t) => el("tr", {}, el("td", {}, el("code", {}, t.name), t.scoped ? el("div", { class: "sub" }, "depends on the run's scope") : null), el("td", {}, el("span", { class: `chip eff-${t.effect}` }, t.effect)), el("td", { class: "sub" }, t.description)))));
+  const sessions = (list, empty) => list.length ? el("table", { class: "runs", style: "min-width: 40rem" },
+    el("thead", {}, el("tr", {}, el("th", {}, "session"), el("th", {}, "status"), el("th", {}, "node"), el("th", {}, "tokens"), el("th", {}, "last event"))),
+    el("tbody", {}, ...list.map((s) => el("tr", {}, el("td", {}, el("a", { href: `/session?id=${encodeURIComponent(s.sessionId)}`, style: "font-weight: 700; text-decoration: none" }, s.title || s.sessionId), el("div", { class: "sub" }, s.sessionId)), el("td", {}, chip(s.status)), el("td", {}, el("code", {}, s.node ?? "—")), el("td", { class: "num" }, kilo(s.tokens)), el("td", { class: "num muted" }, ago(s.lastEventAt)))))) : el("div", { class: "empty" }, empty);
+  const panel = (title, ...body) => el("section", { class: "panel" }, el("div", { class: "head" }, el("h2", {}, title)), el("div", { class: "body" }, ...body));
+  const [flowBox, fresh] = graphBox(a);
+  $("detail").replaceChildren(
+    panel(`definition · ${a.name}`,
+      el("div", { class: "kv" }, el("span", {}, "provider"), el("span", {}, `${a.provider}${a.model ? ` · ${a.model}` : ""}`), el("span", {}, "loop"), el("span", {}, a.loop),
+        el("span", {}, "limits"), el("span", {}, `${a.limits.maxModelCalls} model calls · ${a.limits.maxToolCalls} tool calls · ${a.limits.maxSteps} steps · ${a.limits.timeout}s (tool ${a.limits.toolTimeout}s)`)),
+      flowBox),
+    panel(`tools · ${a.tools.length}`, el("div", { class: "scroll" }, tools)),
+    panel("system prompt", el("div", { class: "box", style: promptOpen ? "" : "max-height: 4.8em; overflow: hidden" }, a.systemPrompt),
+      el("button", { class: "btn small", type: "button", "aria-expanded": promptOpen, onclick: () => { promptOpen = !promptOpen; render(); } }, promptOpen ? "▴ collapse" : "▾ expand")),
+    panel("sessions · live", el("div", { class: "scroll" }, sessions(live(a), "nothing running on this agent"))),
+    panel("sessions · finished", el("div", { class: "scroll" }, sessions(a.sessions.filter((s) => !live(a).includes(s)), "nothing finished yet"))));
+  // Mounted once attached, so it can size itself to the page; later renders move the same element.
+  if (fresh) {
+    // A definition, not a run: every card neutral; nodes that may wait (a checkpoint before them) say so.
+    const nodes = { __end__: { status: "idle", sub: "" } };
+    for (const [name, info] of Object.entries(a.flow.nodes ?? {})) nodes[name] = { status: "idle", sub: info.checkpoint ? "checkpoint before it" : "" };
+    mountFlow(flowBox, a.flow).update({ nodes });
+  }
+}
+
+async function refresh() {
+  agents = await api("agents");
+  render();
+}
+refresh();
+setInterval(refresh, 3000);
+</script>
+</body>
+</html>

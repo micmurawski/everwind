@@ -1,0 +1,180 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>everwind desk — sessions</title>
+<link rel="stylesheet" href="/theme.css">
+<link rel="stylesheet" href="/desk.css">
+</head>
+<body>
+<div class="page">
+  <header class="top">
+    <div style="display: grid; gap: 4px">
+      <div class="eyebrow">everwind · control desk</div>
+      <h1>sessions</h1>
+      <div class="meta" id="meta"><span class="live">live</span></div>
+    </div>
+    <div class="topright">
+      <div class="stats"></div>
+      <button id="theme" class="theme-toggle" type="button">◐ light</button>
+    </div>
+  </header>
+
+  <nav class="tabs" aria-label="Views">
+    <a href="/">projects</a>
+    <a href="/sessions" aria-current="page">sessions</a>
+    <a href="/agents">agents</a>
+  </nav>
+
+  <section class="panel">
+    <div class="head"><h2>sessions</h2><span class="muted" style="font-size: 0.74rem">the latest run of each session · refreshes every 2s</span></div>
+    <div class="body">
+      <div class="row">
+        <div class="filters" role="group" aria-label="Status" id="filters"></div>
+        <button class="attn" id="attn" type="button" aria-pressed="false">⚑ needs attention <span id="attn-n"></span></button>
+      </div>
+      <div class="row">
+        <label for="project" class="muted" style="font-size: 0.74rem">project</label>
+        <select id="project"></select>
+        <label for="task" class="muted" style="font-size: 0.74rem">task</label>
+        <select id="task"></select>
+        <label for="agent" class="muted" style="font-size: 0.74rem">agent</label>
+        <select id="agent"><option value="">all agents</option></select>
+        <label for="query" class="muted" style="font-size: 0.74rem">search</label>
+        <input id="query" type="search" placeholder="session, task text, node…" style="flex: 1 1 260px">
+        <span class="muted" style="font-size: 0.74rem" id="shown"></span>
+      </div>
+      <div class="bulk row" id="bulk" role="toolbar" aria-label="Selected sessions" hidden>
+        <b id="nsel"></b>
+        <span class="grow"></span>
+        <button class="btn warn" type="button" data-state="hold">❚❚ hold</button>
+        <button class="btn" type="button" data-state="run">▶ resume</button>
+        <button class="btn" type="button" data-state="freeze">■ freeze</button>
+        <button class="btn" type="button" id="note">✎ note to all</button>
+        <button class="btn" type="button" id="clear">clear</button>
+      </div>
+      <div class="scroll" style="border: 1px solid var(--line)">
+        <table class="runs">
+          <thead><tr><th><input type="checkbox" id="all" aria-label="Select all shown"></th><th>session</th><th>project · task</th><th>agent</th><th>status</th><th>node</th><th>calls</th><th>tokens</th><th>last event</th></tr></thead>
+          <tbody id="rows"></tbody>
+        </table>
+      </div>
+    </div>
+  </section>
+  <footer>everwind desk · controls are session state and inbox messages in the store, applied by the run at its next step</footer>
+</div>
+<script src="/theme.js"></script>
+<script type="module">
+import { GROUPS, STATUS, act, ago, api, chip, el, header, kilo, toast } from "/desk.js";
+
+// "" = all; "-" = sessions outside any project.
+const params = new URLSearchParams(location.search);
+const state = { sessions: [], filter: "all", agent: params.get("agent") ?? "", project: params.get("project") ?? "", task: params.get("task") ?? "", attn: false, query: "", selected: new Set() };
+
+/** Fill a select with [value, label] options, keeping the current choice when it is still offered. */
+function fill(select, options, current) {
+  const signature = JSON.stringify(options);
+  if (select.dataset.signature !== signature) {
+    select.replaceChildren(...options.map(([value, label]) => el("option", { value }, label)));
+    select.dataset.signature = signature;
+  }
+  select.value = options.some(([value]) => value === current) ? current : "";
+  return select.value;
+}
+const $ = (id) => document.getElementById(id);
+
+function visible() {
+  const q = state.query.toLowerCase();
+  return state.sessions.filter((s) =>
+    (state.filter === "all" || GROUPS[state.filter].includes(s.status)) &&
+    (!state.agent || s.agent === state.agent) &&
+    (!state.project || (state.project === "-" ? s.project === null : s.project === state.project)) &&
+    (!state.task || s.task === state.task) &&
+    (!state.attn || s.flag !== null) &&
+    (!q || [s.sessionId, s.title, s.node ?? "", s.agent, s.projectTitle ?? "", s.taskTitle ?? ""].some((v) => v.toLowerCase().includes(q))));
+}
+
+function render() {
+  const count = (k) => state.sessions.filter((s) => GROUPS[k].includes(s.status)).length;
+  header([["running", "running", count("running")], ["waiting", "waiting", count("waiting")], ["ask", "needs you", count("ask")], ["failed", "failed", count("failed")], ["done", "done", count("done")]]);
+  const filters = [["all", "all", state.sessions.length], ["running", "running", count("running")], ["waiting", "sleeping · held · frozen", count("waiting")], ["ask", "needs you", count("ask")], ["failed", "failed", count("failed")], ["done", "done", count("done")]];
+  $("filters").replaceChildren(...filters.map(([key, label, n]) =>
+    el("button", { type: "button", "aria-pressed": state.filter === key, onclick: () => { state.filter = key; render(); } }, `${label} `, el("span", { style: "opacity: 0.7" }, n))));
+  $("attn-n").textContent = state.sessions.filter((s) => s.flag !== null).length;
+  $("attn").setAttribute("aria-pressed", state.attn);
+  const projects = new Map(state.sessions.filter((s) => s.project !== null).map((s) => [s.project, s.projectTitle ?? s.project]));
+  state.project = fill($("project"), [["", "all"], ...[...projects].sort((a, b) => a[1].localeCompare(b[1])), ["-", "no project"]], state.project);
+  // Tasks of the chosen project (or of all projects).
+  const tasks = new Map(state.sessions.filter((s) => s.task !== null && (!state.project || s.project === state.project)).map((s) => [s.task, s.taskTitle ?? s.task]));
+  $("task").disabled = state.project === "-";
+  state.task = fill($("task"), [["", "all tasks"], ...[...tasks].sort((a, b) => a[1].localeCompare(b[1]))], state.task);
+  const agents = [...new Set(state.sessions.map((s) => s.agent))].sort();
+  state.agent = fill($("agent"), [["", "all agents"], ...agents.map((a) => [a, a])], state.agent);
+  const rows = visible();
+  $("shown").textContent = `${rows.length} of ${state.sessions.length}`;
+  for (const id of [...state.selected]) if (!state.sessions.some((s) => s.sessionId === id)) state.selected.delete(id);
+  $("rows").replaceChildren(...(rows.length ? rows.map((s) => {
+    const selected = state.selected.has(s.sessionId);
+    return el("tr", { class: selected ? "selected" : "" },
+      el("td", {}, el("input", { type: "checkbox", checked: selected, "aria-label": `select ${s.sessionId}`, onchange: (e) => { e.target.checked ? state.selected.add(s.sessionId) : state.selected.delete(s.sessionId); render(); } })),
+      el("td", {},
+        el("a", { href: `/session?id=${encodeURIComponent(s.sessionId)}`, style: "font-weight: 700; text-decoration: none" }, s.title || s.sessionId),
+        el("div", { class: "sub" }, `${s.sessionId}${s.runs > 1 ? ` · ${s.runs} runs` : ""}${s.parentSessionId ? ` · child of ${s.parentSessionId}` : ""}`),
+        s.flag ? el("div", { class: `flag${s.status === "ask" ? " ask" : ""}` }, `⚑ ${s.flag}`) : null),
+      el("td", {}, s.project === null ? el("span", { class: "muted" }, "—") : [
+        el("a", { href: `/?project=${encodeURIComponent(s.project)}&task=${encodeURIComponent(s.task ?? "")}` }, s.projectTitle ?? s.project),
+        el("div", { class: "sub" }, s.taskTitle ?? s.task ?? "")]),
+      el("td", {}, el("a", { class: "chip kind", href: `/agents#${encodeURIComponent(s.agent)}`, style: "text-decoration: none" }, s.agent), el("div", { class: "sub", style: "margin-top: 3px" }, s.model ?? "")),
+      el("td", {}, chip(s.status)),
+      el("td", { class: "num" }, el("code", {}, s.node ?? "—")),
+      el("td", { class: "num" }, `${s.modelCalls} model · ${s.toolCalls} tool`),
+      el("td", { class: "num" }, kilo(s.tokens)),
+      el("td", { class: "num muted" }, ago(s.lastEventAt)));
+  }) : [el("tr", {}, el("td", { colspan: 9 }, el("div", { class: "empty" }, state.sessions.length ? "no session matches the filters" : "no runs in this store yet")))]));
+  $("all").checked = rows.length > 0 && rows.every((s) => state.selected.has(s.sessionId));
+  $("bulk").hidden = state.selected.size === 0;
+  $("nsel").textContent = `${state.selected.size} selected`;
+}
+
+async function refresh() {
+  try {
+    const overview = await api("overview");
+    state.sessions = overview.sessions;
+    $("meta").replaceChildren(el("span", { class: "live" }, "live"), el("span", {}, `${overview.sessions.length} sessions`), el("span", {}, `${overview.agents.length} agents registered`));
+    render();
+  } catch (error) {
+    $("meta").replaceChildren(el("span", { class: "down" }, `! desk unreachable: ${error.message}`));
+  }
+}
+
+$("attn").onclick = () => { state.attn = !state.attn; render(); };
+/** Keep the filters in the URL, so a filtered view can be linked and survives a reload. */
+function remember() {
+  const query = new URLSearchParams();
+  for (const name of ["project", "task", "agent"]) if (state[name]) query.set(name, state[name]);
+  const text = query.toString();
+  history.replaceState(null, "", `/sessions${text ? `?${text}` : ""}`);
+}
+$("agent").onchange = (e) => { state.agent = e.target.value; remember(); render(); };
+$("project").onchange = (e) => { state.project = e.target.value; state.task = ""; remember(); render(); };
+$("task").onchange = (e) => { state.task = e.target.value; remember(); render(); };
+$("query").oninput = (e) => { state.query = e.target.value; render(); };
+$("all").onchange = (e) => { for (const s of visible()) e.target.checked ? state.selected.add(s.sessionId) : state.selected.delete(s.sessionId); render(); };
+$("clear").onclick = () => { state.selected.clear(); render(); };
+for (const button of document.querySelectorAll("#bulk [data-state]")) {
+  button.onclick = () => act(async () => {
+    await api("control", { body: { sessions: [...state.selected], state: button.dataset.state } });
+    await refresh();
+  }, `${button.textContent.trim()}: ${state.selected.size} sessions`);
+}
+$("note").onclick = async () => {
+  const text = prompt(`Note for ${state.selected.size} sessions (delivered before each one's next model turn):`);
+  if (!text) return;
+  await act(() => Promise.all([...state.selected].map((id) => api(`sessions/${encodeURIComponent(id)}/send`, { body: { text } }))), "note sent");
+};
+refresh();
+setInterval(refresh, 2000);
+</script>
+</body>
+</html>

@@ -12,13 +12,16 @@ import {
   PlanThenAct,
   ReAct,
   ReActWithSummary,
+  ReActWithWakeups,
   ScriptedProvider,
   SqliteStore,
   type DurableStore,
   type Message,
   type ModelResponseInput,
   type ToolCallInput,
+  type Tool,
   Tools,
+  scheduleWakeupTool,
   tool,
 } from "../src/index.ts";
 import type { Op } from "../src/journal.ts";
@@ -155,7 +158,7 @@ export async function countTokens(messages: readonly Message[]): Promise<number>
   return messages.reduce((total, item) => total + item.content.length + 1, 0);
 }
 
-export const SCENARIOS: Record<string, () => { loop: Loop; script: ModelResponseInput[] }> = {
+export const SCENARIOS: Record<string, () => { loop: Loop; script: ModelResponseInput[]; tools?: Tool[] }> = {
   react: () => ({ loop: new ReAct(), script: REACT_SCRIPT }),
   react_parallel: () => ({
     loop: new ReAct({ toolConcurrency: 3 }),
@@ -182,13 +185,22 @@ export const SCENARIOS: Record<string, () => { loop: Loop; script: ModelResponse
       { text: "All done" },
     ],
   }),
+  react_with_wakeups: () => ({
+    loop: new ReActWithWakeups({ minDelay: 0 }),
+    tools: [scheduleWakeupTool({ minDelay: 0 })],
+    script: [
+      { toolCalls: [call("a", "lookup", { key: "x" }), call("w", "schedule_wakeup", { delaySeconds: 0.02, prompt: "Check again" })] },
+      { toolCalls: [call("c", "send", { text: "hello" })] },
+      { text: "All done" },
+    ],
+  }),
 };
 
 export function build(name: string, store: DurableStore, world: World): Agent {
   const spec = SCENARIOS[name]();
   return new Agent({
     provider: new ScriptedProvider(spec.script),
-    tools: makeTools(world),
+    tools: makeTools(world).with(...(spec.tools ?? [])),
     loop: spec.loop,
     name: "worker",
     store,

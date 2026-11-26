@@ -19,13 +19,13 @@ import { type JsonObject, KeyedMutex, clone, hexId, sha256, stableStringify } fr
 import type { LogEntry, SharedState, SharedWorld } from "./shared.ts";
 
 /** 1: runs, journal, sessions. 2: shared-state tables. 3: the event log. */
-export const SCHEMA_VERSION = 3;
+export const SCHEMA_VERSION = 5;
 export const INTERRUPTED_CONTENT = "Execution interrupted. Outcome unknown; inspect external state before retrying.";
 /** Live-only events: never stored. A model_response holds everything its chunks said. */
 export const EPHEMERAL_EVENTS: ReadonlySet<string> = new Set(["model_chunk"]);
 
 export type Phase = "scheduled" | "completed" | "marker";
-export type CommandKind = "model" | "tool" | "side_effect" | "version" | "shared_read" | "shared_write";
+export type CommandKind = "model" | "tool" | "side_effect" | "version" | "shared_read" | "shared_write" | "suspend" | "receive" | "checkpoint";
 
 export interface JournalEntry {
   readonly seq: number;
@@ -47,6 +47,54 @@ export interface RunRecord {
   readonly activeSeconds: number;
   readonly start: JsonObject;
   readonly result: JsonObject | null;
+}
+
+/**
+ * A message in a session's durable inbox: a note from an operator, a child's
+ * result, a follow-up. `id` increases per session in arrival order, whatever
+ * the storage layout; journals record ids, never positions.
+ */
+export interface InboxMessage {
+  readonly id: number;
+  readonly sessionId: string;
+  readonly kind: string;
+  readonly payload: JsonObject;
+  /** ISO 8601, UTC. */
+  readonly at: string;
+  /** The run that consumed it, or null while it is pending. */
+  readonly consumedBy: string | null;
+}
+
+/**
+ * What an operator wants a session's runs to do: keep going, hold at the next
+ * step, or freeze (stop and release the run, leaving it recoverable). Not a
+ * message: a run reads the current state at each step, and it is never
+ * journaled, because it never changes which commands a run issues.
+ */
+export type ControlState = "run" | "hold" | "freeze";
+
+export interface ControlRecord {
+  readonly sessionId: string;
+  readonly state: ControlState;
+  readonly note: string | null;
+  /** ISO 8601, UTC. */
+  readonly at: string;
+}
+
+/** A row of the board (projects and tasks; see board.ts): an id, indexed columns and a JSON body. */
+export interface BoardRow {
+  readonly id: string;
+  readonly body: JsonObject;
+}
+
+export interface InboxQuery {
+  /** Only these kinds; all kinds when omitted. */
+  kinds?: readonly string[];
+  /** Only messages no run has consumed. */
+  pending?: boolean;
+  /** Only ids above this one. */
+  after?: number;
+  limit?: number;
 }
 
 /** A stored event. `position` orders all events of a store; `event.sequence` counts within the run. */
@@ -82,7 +130,19 @@ export function runRecord(
 export type Op =
   | { type: "createRun"; record: RunRecord; entries: readonly JournalEntry[] }
   | { type: "claimRun"; sessionId: string; runId: string; owner: string; leaseExpiresAt: number; now: number; force: boolean }
-  | { type: "append"; sessionId: string; runId: string; epoch: number; entries: readonly JournalEntry[]; events: readonly KeyedEvent[] }
+  | {
+      type: "append";
+      sessionId: string;
+      runId: string;
+      epoch: number;
+      entries: readonly JournalEntry[];
+      events: readonly KeyedEvent[];
+      /** Inbox ids consumed by these entries, in the same transaction. */
+      consume?: readonly number[];
+    }
+  | { type: "signal"; sessionId: string; kind: string; payload: JsonObject; at: string }
+  | { type: "control"; record: ControlRecord }
+  | { type: "release"; sessionId: string; runId: string; epoch: number }
   | { type: "heartbeat"; sessionId: string; runId: string; epoch: number; leaseExpiresAt: number; activeSeconds: number }
   | {
       type: "finish";
@@ -113,6 +173,17 @@ export interface Tx {
   findOp(world: string, opId: string): LogEntry | null;
   readLog(world: string, after: number): LogEntry[];
   putSnapshot(world: string, offset: number, body: JsonObject): void;
+  // Inboxes.
+  /** Append a message; returns its id, one above the session's highest. */
+  insertSignal(sessionId: string, kind: string, payload: JsonObject, at: string): number;
+  /** Mark a pending message consumed by a run; a consumed or unknown one is an error. */
+  consumeSignal(sessionId: string, id: number, runId: string): void;
+  putControl(record: ControlRecord): void;
+  // The board.
+  getProject(id: string): JsonObject | null;
+  putProject(id: string, status: string, body: JsonObject): void;
+  getTask(id: string): JsonObject | null;
+  putTask(id: string, project: string, parent: string | null, status: string, body: JsonObject): void;
 }
 
 export function owned(tx: Tx, sessionId: string, runId: string, epoch: number): RunRecord {
@@ -153,8 +224,20 @@ function apply(tx: Tx, op: Op): unknown {
     case "append":
       owned(tx, op.sessionId, op.runId, op.epoch);
       tx.insertEntries(op.sessionId, op.runId, op.epoch, op.entries);
+      for (const id of op.consume ?? []) tx.consumeSignal(op.sessionId, id, op.runId);
       if (op.events.length) tx.insertEvents(op.sessionId, op.runId, op.events);
       return null;
+    case "signal":
+      return tx.insertSignal(op.sessionId, op.kind, op.payload, op.at);
+    case "control":
+      tx.putControl(op.record);
+      return null;
+    case "release": {
+      // Stop owning a run without finishing it: a frozen run waits for recover().
+      const record = owned(tx, op.sessionId, op.runId, op.epoch);
+      tx.putRun({ ...record, owner: null, leaseExpiresAt: 0 });
+      return null;
+    }
     case "heartbeat": {
       const record = owned(tx, op.sessionId, op.runId, op.epoch);
       tx.putRun({ ...record, leaseExpiresAt: op.leaseExpiresAt, activeSeconds: op.activeSeconds });
@@ -285,6 +368,99 @@ export abstract class DurableStore implements SessionStore {
   abstract sharedLog(world: string, after: number, until: number | null): LogEntry[];
   /** @internal */
   abstract sharedSnapshot(world: string, atOrBefore: number | null): JsonObject | null;
+  /** A session's inbox messages in id order. */
+  abstract inbox(sessionId: string, query?: InboxQuery): InboxMessage[];
+  /** A session's control state, or null when none was ever set (it then runs). */
+  abstract control(sessionId: string): ControlRecord | null;
+  /** @internal Board reads; use board.ts. */
+  abstract boardProjects(): JsonObject[];
+  /** @internal */
+  abstract boardTasks(filter: { project?: string; parent?: string; status?: string }): JsonObject[];
+  /** Seconds between inbox checks while a run waits, for writers in other processes; null: only this process writes. */
+  protected readonly pollInterval: number | null = null;
+  private readonly listeners = new Map<string, Set<() => void>>();
+
+  // Inboxes --------------------------------------------------------------
+  /**
+   * Put a message in a session's inbox and wake a run of that session waiting
+   * for its kind. Returns the message id.
+   */
+  async signal(sessionId: string, kind: string, payload: JsonObject = {}): Promise<number> {
+    validateSessionId(sessionId);
+    if (typeof kind !== "string" || !kind) throw new Error("A signal needs a nonempty kind");
+    const id = await this.committer.submit<number>({ type: "signal", sessionId, kind, payload: clone(payload), at: new Date().toISOString() });
+    for (const wake of [...(this.listeners.get(sessionId) ?? [])]) wake();
+    return id;
+  }
+
+  /** Set what a session's runs should do; a run waiting on the session notices at once. */
+  async setControl(sessionId: string, state: ControlState, note: string | null = null): Promise<void> {
+    validateSessionId(sessionId);
+    if (!["run", "hold", "freeze"].includes(state)) throw new Error(`Unknown control state ${JSON.stringify(state)}`);
+    await this.committer.submit({ type: "control", record: { sessionId, state, note, at: new Date().toISOString() } });
+    for (const wake of [...(this.listeners.get(sessionId) ?? [])]) wake();
+  }
+
+  /** @internal Wake runs of this session that wait for its inbox or control state (after a custom write). */
+  notify(sessionId: string): void {
+    for (const wake of [...(this.listeners.get(sessionId) ?? [])]) wake();
+  }
+
+  /** @internal Release a run's lease without finishing it (a frozen run). */
+  async releaseRun(sessionId: string, runId: string, epoch: number): Promise<void> {
+    await this.committer.submit({ type: "release", sessionId, runId, epoch });
+  }
+
+  /**
+   * The oldest pending message of one of `kinds`, as soon as there is one; null
+   * once `deadline` (epoch milliseconds) passes, or as soon as `interrupt()`
+   * returns true (checked whenever the session's inbox or control state
+   * changes). Empty `kinds` waits for the deadline or the interrupt only.
+   */
+  async waitForSignal(
+    sessionId: string,
+    kinds: readonly string[],
+    options: { deadline: number | null; signal?: AbortSignal; interrupt?: () => boolean },
+  ): Promise<InboxMessage | null> {
+    if (!kinds.length && options.deadline === null && options.interrupt === undefined) {
+      throw new Error("A wait needs signal kinds, a deadline or an interrupt");
+    }
+    for (;;) {
+      options.signal?.throwIfAborted();
+      if (options.interrupt?.()) return null;
+      if (kinds.length) {
+        const [first] = this.inbox(sessionId, { kinds, pending: true, limit: 1 });
+        if (first !== undefined) return first;
+      }
+      const left = options.deadline === null ? Number.POSITIVE_INFINITY : options.deadline - Date.now();
+      if (left <= 0) return null;
+      const watching = kinds.length > 0 || options.interrupt !== undefined;
+      const poll = watching && this.pollInterval !== null ? this.pollInterval * 1000 : Number.POSITIVE_INFINITY;
+      await new Promise<void>((resolveWait, rejectWait) => {
+        let listeners = this.listeners.get(sessionId);
+        if (listeners === undefined) this.listeners.set(sessionId, (listeners = new Set()));
+        const set = listeners;
+        const done = () => {
+          set.delete(done);
+          if (!set.size) this.listeners.delete(sessionId);
+          if (timer !== null) clearTimeout(timer);
+          options.signal?.removeEventListener("abort", aborted);
+        };
+        const wake = () => {
+          done();
+          resolveWait();
+        };
+        const aborted = () => {
+          done();
+          rejectWait(options.signal?.reason);
+        };
+        const wait = Math.min(left, poll, 2 ** 31 - 1);
+        const timer = Number.isFinite(wait) ? setTimeout(wake, wait) : null;
+        if (watching) set.add(wake);
+        options.signal?.addEventListener("abort", aborted, { once: true });
+      });
+    }
+  }
 
   /** Write the session's log as JSONL, in the session log format; overwrites `path`. */
   exportLog(sessionId: string, path: string): string {
@@ -334,8 +510,9 @@ export abstract class DurableStore implements SessionStore {
     epoch: number,
     entries: readonly JournalEntry[],
     events: readonly KeyedEvent[] = [],
+    consume: readonly number[] = [],
   ): Promise<void> {
-    await this.committer.submit({ type: "append", sessionId, runId, epoch, entries, events });
+    await this.committer.submit({ type: "append", sessionId, runId, epoch, entries, events, consume });
   }
 
   async heartbeat(sessionId: string, runId: string, epoch: number, options: { ttl: number; activeSeconds: number }): Promise<void> {
@@ -384,6 +561,12 @@ export class MemoryStoreData {
   /** position i at index i - 1. */
   events: LoggedEvent[] = [];
   eventKeys = new Map<string, Set<string>>();
+  /** sessionId -> messages; id i at index i - 1. */
+  inbox = new Map<string, InboxMessage[]>();
+  controls = new Map<string, ControlRecord>();
+  projects = new Map<string, JsonObject>();
+  /** In creation order. */
+  tasks = new Map<string, JsonObject>();
 }
 
 const runKey = (sessionId: string, runId: string) => `${sessionId}\u0000${runId}`;
@@ -398,8 +581,50 @@ class MemoryTx implements Tx {
   private logs: [string, LogEntry][] = [];
   private snapshots: [string, number, JsonObject][] = [];
   private events: [string, string, string, Event][] = [];
+  private signals: InboxMessage[] = [];
+  private consumed: [string, number, string][] = [];
+  private controls: ControlRecord[] = [];
+  private projects = new Map<string, JsonObject>();
+  private tasks = new Map<string, JsonObject>();
 
   constructor(private readonly data: MemoryStoreData) {}
+
+  getProject(id: string): JsonObject | null {
+    const found = this.projects.get(id) ?? this.data.projects.get(id);
+    return found === undefined ? null : clone(found);
+  }
+
+  putProject(id: string, _status: string, body: JsonObject): void {
+    this.projects.set(id, clone(body));
+  }
+
+  getTask(id: string): JsonObject | null {
+    const found = this.tasks.get(id) ?? this.data.tasks.get(id);
+    return found === undefined ? null : clone(found);
+  }
+
+  putTask(id: string, _project: string, _parent: string | null, _status: string, body: JsonObject): void {
+    this.tasks.set(id, clone(body));
+  }
+
+  putControl(record: ControlRecord): void {
+    this.controls.push(clone(record));
+  }
+
+  insertSignal(sessionId: string, kind: string, payload: JsonObject, at: string): number {
+    const id = (this.data.inbox.get(sessionId)?.length ?? 0) + this.signals.filter((item) => item.sessionId === sessionId).length + 1;
+    this.signals.push({ id, sessionId, kind, payload: clone(payload), at, consumedBy: null });
+    return id;
+  }
+
+  consumeSignal(sessionId: string, id: number, runId: string): void {
+    const message = this.data.inbox.get(sessionId)?.[id - 1];
+    if (message === undefined) throw new JournalError(`Inbox message ${id} of session ${sessionId} does not exist`);
+    if (message.consumedBy !== null || this.consumed.some(([s, i]) => s === sessionId && i === id)) {
+      throw new JournalError(`Inbox message ${id} of session ${sessionId} was already consumed`);
+    }
+    this.consumed.push([sessionId, id, runId]);
+  }
 
   getRun(sessionId: string, runId: string): RunRecord | null {
     const key = runKey(sessionId, runId);
@@ -461,6 +686,18 @@ class MemoryTx implements Tx {
   }
 
   commit(): void {
+    for (const [id, body] of this.projects) this.data.projects.set(id, body);
+    for (const [id, body] of this.tasks) this.data.tasks.set(id, body);
+    for (const record of this.controls) this.data.controls.set(record.sessionId, record);
+    for (const message of this.signals) {
+      let list = this.data.inbox.get(message.sessionId);
+      if (list === undefined) this.data.inbox.set(message.sessionId, (list = []));
+      list.push(message);
+    }
+    for (const [sessionId, id, runId] of this.consumed) {
+      const list = this.data.inbox.get(sessionId) as InboxMessage[];
+      list[id - 1] = { ...list[id - 1], consumedBy: runId };
+    }
     for (const [key, record] of this.runs) this.data.runs.set(key, record);
     for (const [key, entry] of this.entries) {
       let map = this.data.entries.get(key);
@@ -493,6 +730,15 @@ class MemoryTx implements Tx {
       });
     }
   }
+}
+
+function selectInbox(messages: readonly InboxMessage[], query: InboxQuery): InboxMessage[] {
+  const kinds = query.kinds === undefined ? null : new Set(query.kinds);
+  const selected = messages.filter(
+    (item) =>
+      item.id > (query.after ?? 0) && (kinds === null || kinds.has(item.kind)) && (!query.pending || item.consumedBy === null),
+  );
+  return query.limit === undefined ? selected : selected.slice(0, query.limit);
 }
 
 const PHASE_ORDER: Record<Phase, number> = { scheduled: 0, completed: 1, marker: 2 };
@@ -555,6 +801,30 @@ export class MemoryStore extends DurableStore {
       .slice(after)
       .filter((stored) => stored.event.sessionId === sessionId && (runId === undefined || stored.event.runId === runId));
     return clone(limit === undefined ? found : found.slice(0, limit));
+  }
+
+  inbox(sessionId: string, query: InboxQuery = {}): InboxMessage[] {
+    return clone(selectInbox(this.data.inbox.get(sessionId) ?? [], query));
+  }
+
+  control(sessionId: string): ControlRecord | null {
+    const record = this.data.controls.get(sessionId);
+    return record === undefined ? null : clone(record);
+  }
+
+  boardProjects(): JsonObject[] {
+    return clone([...this.data.projects.values()]);
+  }
+
+  boardTasks(filter: { project?: string; parent?: string; status?: string }): JsonObject[] {
+    return clone(
+      [...this.data.tasks.values()].filter(
+        (task) =>
+          (filter.project === undefined || task.project === filter.project) &&
+          (filter.parent === undefined || task.parent === filter.parent) &&
+          (filter.status === undefined || task.status === filter.status),
+      ),
+    );
   }
 
   eventKeys(sessionId: string, runId: string): Set<string> {
@@ -639,6 +909,38 @@ CREATE TABLE IF NOT EXISTS events (
   UNIQUE (session_id, run_id, key)
 );
 CREATE INDEX IF NOT EXISTS events_by_session ON events (session_id, position);
+CREATE TABLE IF NOT EXISTS inbox (
+  session_id TEXT NOT NULL,
+  id INTEGER NOT NULL,
+  kind TEXT NOT NULL,
+  payload TEXT NOT NULL,
+  at TEXT NOT NULL,
+  consumed_by TEXT,
+  PRIMARY KEY (session_id, id)
+);
+CREATE INDEX IF NOT EXISTS inbox_pending ON inbox (session_id, consumed_by, id);
+CREATE TABLE IF NOT EXISTS projects (
+  id TEXT PRIMARY KEY,
+  status TEXT NOT NULL,
+  body TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS tasks (
+  id TEXT PRIMARY KEY,
+  project TEXT NOT NULL,
+  parent TEXT,
+  status TEXT NOT NULL,
+  created INTEGER NOT NULL,
+  body TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS tasks_by_project ON tasks (project, created);
+CREATE INDEX IF NOT EXISTS tasks_by_parent ON tasks (parent, created);
+CREATE INDEX IF NOT EXISTS tasks_by_status ON tasks (status, created);
+CREATE TABLE IF NOT EXISTS controls (
+  session_id TEXT PRIMARY KEY,
+  state TEXT NOT NULL,
+  note TEXT,
+  at TEXT NOT NULL
+);
 CREATE INDEX IF NOT EXISTS events_by_run ON events (session_id, run_id, sequence);
 `;
 
@@ -676,8 +978,57 @@ function isConstraint(error: unknown): boolean {
   return error instanceof Error && /constraint/i.test(error.message);
 }
 
+type InboxRow = { session_id: string; id: number; kind: string; payload: string; at: string; consumed_by: string | null };
+
+function messageFromRow(row: InboxRow): InboxMessage {
+  return { id: row.id, sessionId: row.session_id, kind: row.kind, payload: JSON.parse(row.payload), at: row.at, consumedBy: row.consumed_by };
+}
+
 class SqliteTx implements Tx {
   constructor(private readonly db: Database) {}
+
+  insertSignal(sessionId: string, kind: string, payload: JsonObject, at: string): number {
+    const { next } = this.db.query("SELECT COALESCE(MAX(id), 0) + 1 AS next FROM inbox WHERE session_id = ?").get(sessionId) as { next: number };
+    this.db.query("INSERT INTO inbox (session_id, id, kind, payload, at) VALUES (?, ?, ?, ?, ?)").run(sessionId, next, kind, JSON.stringify(payload), at);
+    return next;
+  }
+
+  getProject(id: string): JsonObject | null {
+    const row = this.db.query("SELECT body FROM projects WHERE id = ?").get(id) as { body: string } | null;
+    return row === null ? null : JSON.parse(row.body);
+  }
+
+  putProject(id: string, status: string, body: JsonObject): void {
+    this.db.query("INSERT OR REPLACE INTO projects (id, status, body) VALUES (?, ?, ?)").run(id, status, JSON.stringify(body));
+  }
+
+  getTask(id: string): JsonObject | null {
+    const row = this.db.query("SELECT body FROM tasks WHERE id = ?").get(id) as { body: string } | null;
+    return row === null ? null : JSON.parse(row.body);
+  }
+
+  putTask(id: string, project: string, parent: string | null, status: string, body: JsonObject): void {
+    // Keeps its creation position on update, so tasks list in the order they were created.
+    this.db
+      .query(
+        "INSERT INTO tasks (id, project, parent, status, created, body) VALUES (?, ?, ?, ?, (SELECT COALESCE(MAX(created), 0) + 1 FROM tasks), ?) " +
+          "ON CONFLICT(id) DO UPDATE SET project = excluded.project, parent = excluded.parent, status = excluded.status, body = excluded.body",
+      )
+      .run(id, project, parent, status, JSON.stringify(body));
+  }
+
+  putControl(record: ControlRecord): void {
+    this.db
+      .query("INSERT OR REPLACE INTO controls (session_id, state, note, at) VALUES (?, ?, ?, ?)")
+      .run(record.sessionId, record.state, record.note, record.at);
+  }
+
+  consumeSignal(sessionId: string, id: number, runId: string): void {
+    this.db.query("UPDATE inbox SET consumed_by = ? WHERE session_id = ? AND id = ? AND consumed_by IS NULL").run(runId, sessionId, id);
+    // Older Bun versions return nothing from run(): ask SQLite for the count.
+    const { changed } = this.db.query("SELECT changes() AS changed").get() as { changed: number };
+    if (changed !== 1) throw new JournalError(`Inbox message ${id} of session ${sessionId} does not exist or was already consumed`);
+  }
 
   getRun(sessionId: string, runId: string): RunRecord | null {
     const row = this.db
@@ -786,6 +1137,8 @@ class SqliteTx implements Tx {
  */
 export class SqliteStore extends DurableStore {
   readonly path: string;
+  /** Other processes may write to the file: a waiting run also checks its inbox this often. */
+  protected override readonly pollInterval: number | null = 0.25;
   /** @internal */
   readonly db: Database;
 
@@ -798,7 +1151,7 @@ export class SqliteStore extends DurableStore {
     this.db.exec("PRAGMA synchronous=FULL");
     this.db.exec("PRAGMA busy_timeout=5000");
     const { user_version: version } = this.db.query("PRAGMA user_version").get() as { user_version: number };
-    if (![0, 1, 2, SCHEMA_VERSION].includes(version)) {
+    if (![0, 1, 2, 3, 4, SCHEMA_VERSION].includes(version)) {
       throw new JournalError(`Unsupported journal schema version ${version} in ${this.path}`);
     }
     // One statement per call: older Bun versions run only the first statement of a string.
@@ -890,6 +1243,46 @@ export class SqliteStore extends DurableStore {
     }));
   }
 
+  boardProjects(): JsonObject[] {
+    return (this.db.query("SELECT body FROM projects ORDER BY rowid").all() as { body: string }[]).map((row) => JSON.parse(row.body));
+  }
+
+  boardTasks(filter: { project?: string; parent?: string; status?: string }): JsonObject[] {
+    const clauses: string[] = [];
+    const params: string[] = [];
+    for (const name of ["project", "parent", "status"] as const) {
+      if (filter[name] === undefined) continue;
+      clauses.push(`${name} = ?`);
+      params.push(filter[name] as string);
+    }
+    const where = clauses.length ? ` WHERE ${clauses.join(" AND ")}` : "";
+    return (this.db.query(`SELECT body FROM tasks${where} ORDER BY created`).all(...params) as { body: string }[]).map((row) => JSON.parse(row.body));
+  }
+
+  control(sessionId: string): ControlRecord | null {
+    const row = this.db.query("SELECT session_id, state, note, at FROM controls WHERE session_id = ?").get(sessionId) as {
+      session_id: string;
+      state: ControlState;
+      note: string | null;
+      at: string;
+    } | null;
+    return row === null ? null : { sessionId: row.session_id, state: row.state, note: row.note, at: row.at };
+  }
+
+  inbox(sessionId: string, query: InboxQuery = {}): InboxMessage[] {
+    const clauses = ["session_id = ?", "id > ?"];
+    const params: (string | number)[] = [sessionId, query.after ?? 0];
+    if (query.kinds !== undefined) {
+      if (!query.kinds.length) return [];
+      clauses.push(`kind IN (${query.kinds.map(() => "?").join(", ")})`);
+      params.push(...query.kinds);
+    }
+    if (query.pending) clauses.push("consumed_by IS NULL");
+    const limit = query.limit === undefined ? "" : ` LIMIT ${Math.max(0, Math.floor(query.limit))}`;
+    const rows = this.db.query(`SELECT * FROM inbox WHERE ${clauses.join(" AND ")} ORDER BY id${limit}`).all(...params) as InboxRow[];
+    return rows.map(messageFromRow);
+  }
+
   eventKeys(sessionId: string, runId: string): Set<string> {
     const rows = this.db.query("SELECT key FROM events WHERE session_id = ? AND run_id = ?").all(sessionId, runId) as {
       key: string;
@@ -971,6 +1364,17 @@ export class RunJournal {
     this.lastRecordedSeq = lastSeq;
   }
 
+  /** The latest usable checkpoint a replay may start from (at or before untilSeq), or null. */
+  latestCheckpoint(): JournalEntry | null {
+    let latest: JournalEntry | null = null;
+    for (const entry of this.recordedEntries.values()) {
+      if (entry.kind !== "checkpoint" || entry.phase !== "completed" || entry.payload.skipped) continue;
+      if (this.untilSeq !== null && entry.seq > this.untilSeq) continue;
+      if (latest === null || entry.seq > latest.seq) latest = entry;
+    }
+    return latest;
+  }
+
   recorded(seq: number): [JournalEntry | null, JournalEntry | null] {
     return [this.recordedEntries.get(`${seq}:scheduled`) ?? null, this.recordedEntries.get(`${seq}:completed`) ?? null];
   }
@@ -1005,9 +1409,14 @@ export class RunJournal {
   }
 
   async append(...entries: JournalEntry[]): Promise<void> {
+    await this.appendConsuming([], ...entries);
+  }
+
+  /** Append entries and, in the same transaction, mark these inbox messages consumed by this run. */
+  async appendConsuming(consume: readonly number[], ...entries: JournalEntry[]): Promise<void> {
     if (this.readonly) throw new ReplayExhausted(entries[0]?.seq ?? 0, "inspection replay does not write");
     await this.flush();
-    await (this.store as DurableStore).append(this.sessionId, this.runId, this.epoch, entries, this.takeEvents());
+    await (this.store as DurableStore).append(this.sessionId, this.runId, this.epoch, entries, this.takeEvents(), consume);
   }
 
   /** Queue entries without waiting; a later append or flush() reports failures. */

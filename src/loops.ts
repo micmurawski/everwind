@@ -3,6 +3,11 @@
 import { OlderMessages, Summarize, type TokenCounter } from "./contextOps.ts";
 import { END, Flow, Node, node } from "./flow.ts";
 import type { Runtime } from "./runtime.ts";
+import { type GateOptions, gateStep } from "./inbox.ts";
+import { type QuestionOptions, answerStep, questionRequest } from "./operator.ts";
+import { readTaskScope } from "./scope.ts";
+import { settleStep, waitRequest, waitStep } from "./tasks.ts";
+import { type WakeupOptions, wakeupRequest, wakeupStep } from "./wakeup.ts";
 
 export interface Loop {
   run(runtime: Runtime): Promise<void>;
@@ -21,15 +26,24 @@ export function finishStep(runtime: Runtime): void {
   runtime.finish(runtime.run.messages[runtime.run.messages.length - 1].content);
 }
 
-function reactNodes(toolConcurrency: number, beforeModel?: Node): Node {
+/**
+ * afterTools: the first and last node of a chain run between tools and the next model turn.
+ * beforeFinish: a node between an answer and finish; its "done" finishes, its "continue" goes back to the entry.
+ */
+function reactNodes(toolConcurrency: number, beforeModel?: Node, afterTools?: [Node, Node], beforeFinish?: Node): Node {
   if (!Number.isInteger(toolConcurrency) || toolConcurrency < 1) throw new Error("Tool concurrency must be positive");
   const callLlm = node(modelStep, { name: "call_llm" });
   const finish = node(finishStep, { name: "finish" });
   const tools = node((runtime) => runtime.executeTools({ concurrency: toolConcurrency }), { name: "tools" });
-  callLlm.on("tools", tools).on("answer", finish);
+  callLlm.on("tools", tools).on("answer", beforeFinish ?? finish);
   const entry = beforeModel ?? callLlm;
   if (beforeModel !== undefined) beforeModel.then(callLlm);
-  tools.then(entry);
+  if (afterTools === undefined) tools.then(entry);
+  else {
+    tools.then(afterTools[0]);
+    afterTools[1].then(entry);
+  }
+  if (beforeFinish !== undefined) beforeFinish.on("done", finish).on("continue", entry);
   finish.then(END);
   return entry;
 }
@@ -150,6 +164,62 @@ export class PlanThenAct implements Loop {
     );
     plan.then(reactNodes(this.toolConcurrency));
     return new Flow(plan);
+  }
+
+  run(runtime: Runtime): Promise<void> {
+    return this.toFlow().run(runtime);
+  }
+}
+
+/**
+ * ReAct whose model can pace itself, ask you questions, and be messaged while it works.
+ *
+ * gate -> call_llm -> tools -> ask -> wakeup -> gate, or call_llm -> finish on an answer.
+ * The `gate` delivers inbox messages (agent.send) before each model turn. The
+ * `ask` node waits for your reply (agent.reply) when the model called
+ * ask_operator (see askOperatorTool). The `wakeup` node suspends for as long as
+ * the model asked with schedule_wakeup (see scheduleWakeupTool), then gives it
+ * the wakeup prompt; a message ends the sleep early. Waiting is durable and does
+ * not count toward limits.timeout; give the agent enough maxSteps and
+ * maxModelCalls for its wakeups.
+ */
+export class ReActWithWakeups implements Loop {
+  readonly toolConcurrency: number;
+  readonly wakeup: WakeupOptions;
+  readonly gate: GateOptions;
+  readonly ask: QuestionOptions;
+
+  constructor(options: WakeupOptions & { toolConcurrency?: number; gate?: GateOptions; ask?: QuestionOptions } = {}) {
+    const { toolConcurrency = 1, gate = {}, ask = {}, ...wakeup } = options;
+    this.toolConcurrency = toolConcurrency;
+    this.wakeup = wakeup;
+    this.gate = gate;
+    this.ask = ask;
+    this.toFlow();
+  }
+
+  /**
+   * ask -> wakeup -> wait, each checkpointed before it waits, so a run recovered (or frozen) while waiting
+   * restarts there. The checkpoint decisions read only the conversation, so replays make the same ones.
+   */
+  private waits(): [Node, Node] {
+    const ask = node(answerStep(this.ask), { name: "ask", checkpoint: (runtime) => questionRequest(runtime, this.ask) !== null });
+    const wakeup = node(wakeupStep(this.wakeup), { name: "wakeup", checkpoint: (runtime) => wakeupRequest(runtime, this.wakeup) !== null });
+    const wait = node(waitStep(), { name: "wait", checkpoint: (runtime) => waitRequest(runtime) !== null });
+    ask.then(wakeup).then(wait);
+    return [ask, wait];
+  }
+
+  toFlow(): Flow {
+    return new Flow(
+      reactNodes(
+        this.toolConcurrency,
+        node(gateStep(this.gate), { name: "gate" }),
+        this.waits(),
+        // A task's answer finishes it only once its children are done; a checkpoint before, as settling can wait long.
+        node(settleStep(), { name: "settle", checkpoint: (runtime) => readTaskScope(runtime.run.scope) !== null }),
+      ),
+    );
   }
 
   run(runtime: Runtime): Promise<void> {

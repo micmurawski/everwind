@@ -10,15 +10,18 @@ import {
   type Selection,
   OlderMessages,
   type TokenCounter,
+  isPinned,
   isSummary,
 } from "./contextOps.ts";
-import { DeadlineExceeded, LimitReached, ReplayExhausted, SessionLogError, VersionUnsupported, isStopError } from "./errors.ts";
+import { DeadlineExceeded, Frozen, LimitReached, ReplayExhausted, SessionLogError, VersionUnsupported, isStopError } from "./errors.ts";
 import { validateConversation } from "./history.ts";
 import {
+  type DurableStore,
   EPHEMERAL_EVENTS,
   INTERRUPTED_CONTENT,
+  type InboxMessage,
   type JournalEntry,
-  type RunJournal,
+  RunJournal,
   commandKey,
 } from "./journal.ts";
 import { type Provider, providerModel, providerName } from "./providers/base.ts";
@@ -29,6 +32,7 @@ import {
   type Event,
   type Limits,
   type Message,
+  type MessageInput,
   type ModelRequest,
   type ModelResponse,
   type Run,
@@ -37,7 +41,7 @@ import {
   message,
   modelResponse,
 } from "./types.ts";
-import { type JsonObject, abortable, childController, clone, hexId } from "./util.ts";
+import { type JsonObject, abortable, childController, clone, hexId, sleep } from "./util.ts";
 
 export type { Loop } from "./loops.ts";
 export type { Provider } from "./providers/base.ts";
@@ -47,8 +51,44 @@ const currentCall = new AsyncLocalStorage<string>();
 /** Events that happen once per attempt (owner epoch), not once per position in the run. */
 const ATTEMPT_EVENTS = new Set(["run_recovered", "fork_live", "command_retried"]);
 
+/** Why a value is not plain JSON (objects, arrays, strings, finite numbers, booleans, null), or null. */
+function jsonProblem(value: unknown, path: string): string | null {
+  if (value === null || typeof value === "string" || typeof value === "boolean") return null;
+  if (typeof value === "number") return Number.isFinite(value) ? null : `${path} is not a finite number`;
+  if (Array.isArray(value)) {
+    for (let index = 0; index < value.length; index++) {
+      const problem = jsonProblem(value[index], `${path}[${index}]`);
+      if (problem !== null) return problem;
+    }
+    return null;
+  }
+  if (typeof value === "object") {
+    const proto = Object.getPrototypeOf(value);
+    if (proto !== Object.prototype && proto !== null) return `${path} is a ${(value as object).constructor?.name ?? "class instance"}, not plain JSON`;
+    for (const [key, item] of Object.entries(value)) {
+      const problem = jsonProblem(item, `${path}.${key}`);
+      if (problem !== null) return problem;
+    }
+    return null;
+  }
+  return `${path} is a ${typeof value}, not JSON`;
+}
+
+/**
+ * The journal key of a model call: its messages, purpose, turn and the names
+ * of the tools offered. Like Temporal, which checks commands, not activity
+ * arguments: a replay returns the recorded response, so a changed tool
+ * description or schema cannot change a recorded call. A removed or added tool
+ * still changes the key. Full specs stay in the model_request event.
+ * runId is excluded so that a fork can match its parent's recorded prefix.
+ */
 function modelKey(request: ModelRequest): string {
-  // runId is excluded so that a fork can match its parent's recorded prefix.
+  const { runId: _, tools, ...rest } = request;
+  return commandKey("model", { ...rest, tools: tools.map((spec) => spec.name).sort() });
+}
+
+/** The key journals recorded before model calls were keyed on tool names. */
+function legacyModelKey(request: ModelRequest): string {
   const { runId: _, ...rest } = request;
   return commandKey("model", rest);
 }
@@ -64,11 +104,29 @@ export interface RuntimeOptions {
   shared?: SharedWorld | null;
   /** Aborted when the run times out or is cancelled. */
   signal?: AbortSignal;
+  /** Stops the run's timeout budget while a durable timer waits. */
+  clock?: RunClock | null;
+}
+
+/** What ended a suspension: its timer, or a pending inbox message of a kind it waited for. */
+export interface Wake {
+  by: "timer" | "signal";
+  /** ISO 8601, UTC. */
+  at: string;
+  messageId: number | null;
+  kind: string | null;
+}
+
+/** The run's active-time clock: a sleeping run does not use up its timeout. */
+export interface RunClock {
+  pause(): void;
+  resume(): void;
 }
 
 export class Runtime {
   readonly journal: RunJournal | null;
   readonly signal: AbortSignal;
+  private readonly clock: RunClock | null;
   /** Replaying: upcoming commands were recorded earlier and are not repeated. */
   replaying: boolean;
   /** @internal Last command whose result is reflected in the run's state. */
@@ -85,6 +143,7 @@ export class Runtime {
   private contextVersion = 0;
   private compactionToken: object | null = null;
   private readonly eventOrdinals = new Map<string, number>();
+  private wantCheckpoint = false;
 
   constructor(
     readonly run: Run,
@@ -95,6 +154,7 @@ export class Runtime {
   ) {
     this.journal = options.journal ?? null;
     this.signal = options.signal ?? new AbortController().signal;
+    this.clock = options.clock ?? null;
     this.replaying = this.journal !== null && this.journal.lastRecordedSeq > 0;
     this.liveEvent = options.liveEvent ?? null;
     this.world = options.shared ?? null;
@@ -221,6 +281,259 @@ export class Runtime {
     return recorded;
   }
 
+  /** The run's durable store, or null for a run without one (no inbox, no board). */
+  get store(): DurableStore | null {
+    return this.journal?.store ?? null;
+  }
+
+  /**
+   * A value read from outside the run (the board, the clock, a file), journaled:
+   * a replay returns the recorded value instead of reading again, so loop code
+   * that branches on it stays deterministic. `produce` must be synchronous and
+   * return plain JSON.
+   */
+  record<T>(name: string, produce: () => T): T {
+    return this.sideEffect(`record:${name}`, produce);
+  }
+
+  /** A durable timer: wait `seconds`, without using up the run's timeout. */
+  async sleep(seconds: number, options: { reason?: string } = {}): Promise<void> {
+    await this.suspend({ seconds, reason: options.reason });
+  }
+
+  /**
+   * Wait durably until `seconds` pass or a message of one of `wakeOn` kinds is
+   * pending in this session's inbox, whichever comes first. The message is not
+   * consumed: take it with receive(). Waiting does not use up the run's timeout.
+   *
+   * The wake-up time is journaled before waiting, and what woke the run after:
+   * a run recovered while waiting keeps the original wake-up time, and a replay
+   * wakes the same way without waiting. A message already pending wakes it at once.
+   */
+  async suspend(options: { seconds?: number; wakeOn?: readonly string[]; reason?: string }): Promise<Wake> {
+    const seconds = options.seconds ?? null;
+    const wakeOn = [...(options.wakeOn ?? [])];
+    if (seconds !== null && (typeof seconds !== "number" || !Number.isFinite(seconds) || seconds < 0)) {
+      throw new Error("Suspend seconds must be a finite, nonnegative number");
+    }
+    if (wakeOn.some((kind) => typeof kind !== "string" || !kind)) throw new Error("wakeOn kinds must be nonempty strings");
+    if (seconds === null && !wakeOn.length) throw new Error("suspend() needs seconds, wakeOn kinds, or both");
+    this.ensureIdle();
+    this.busy = "a suspension";
+    try {
+      const seq = this.nextSeq();
+      const key = commandKey("suspend", { seconds, wakeOn });
+      let fireAt = seconds === null ? null : Date.now() + seconds * 1000;
+      const started = { seq, seconds, wakeOn, reason: options.reason ?? null };
+      if (this.journal !== null) {
+        const [scheduled, completed] = this.journal.check(seq, "suspend", key);
+        if (completed !== null) {
+          const wake = completed.payload as unknown as Wake;
+          // Re-emitted on replay: a crash may have lost it, and the log keeps each event once.
+          this.run.emit("woke", { seq, ...wake });
+          this.applied = seq;
+          return wake;
+        }
+        this.goLive();
+        if (scheduled === null) {
+          // Emitted first, so the event is written with the scheduled row.
+          this.run.emit("suspended", { ...started, fireAt: fireAt === null ? null : new Date(fireAt).toISOString() });
+          await this.journal.append({ seq, phase: "scheduled", kind: "suspend", key, payload: { fireAt } });
+        } else {
+          // Recovered while waiting: keep the original wake-up time.
+          fireAt = scheduled.payload.fireAt as number | null;
+          this.run.emit("command_retried", { seq, command: "suspend", fireAt: fireAt === null ? null : new Date(fireAt).toISOString() });
+        }
+      } else {
+        this.run.emit("suspended", { ...started, fireAt: fireAt === null ? null : new Date(fireAt).toISOString() });
+      }
+      const store = this.store;
+      if (store === null && fireAt === null) throw new Error("A run without a durable store has no inbox to wake it");
+      this.clock?.pause();
+      let message: InboxMessage | null;
+      try {
+        if (store === null) {
+          await sleep(Math.max((fireAt as number) - Date.now(), 0) / 1000, this.signal);
+          message = null;
+        } else {
+          // A freeze ends the wait at once; the suspension stays journaled, so recovery waits out the rest.
+          const frozen = () => store.control(this.run.sessionId)?.state === "freeze";
+          message = await store.waitForSignal(this.run.sessionId, wakeOn, { deadline: fireAt, signal: this.signal, interrupt: frozen });
+          if (message === null && frozen()) await this.freeze(null);
+        }
+      } finally {
+        this.clock?.resume();
+      }
+      this.ensureActive();
+      const wake: Wake =
+        message === null
+          ? { by: "timer", at: new Date().toISOString(), messageId: null, kind: null }
+          : { by: "signal", at: new Date().toISOString(), messageId: message.id, kind: message.kind };
+      this.run.emit("woke", { seq, ...wake });
+      if (this.journal !== null) {
+        await this.journal.append({ seq, phase: "completed", kind: "suspend", key, payload: { ...wake } });
+      }
+      this.applied = seq;
+      return wake;
+    } finally {
+      this.busy = null;
+    }
+  }
+
+  /**
+   * Take this session's pending inbox messages of `kinds` (all kinds when
+   * omitted), oldest first, and mark them consumed. Consumption is journaled
+   * with the messages: a replay returns the same ones. A run without a durable
+   * store has no inbox and receives nothing.
+   */
+  async receive(options: { kinds?: readonly string[]; limit?: number } = {}): Promise<InboxMessage[]> {
+    this.ensureActive();
+    const kinds = options.kinds === undefined ? null : [...options.kinds];
+    const seq = this.nextSeq();
+    if (this.journal === null) {
+      this.applied = seq;
+      return [];
+    }
+    const key = commandKey("receive", { kinds, limit: options.limit ?? null });
+    const [, completed] = this.journal.check(seq, "receive", key);
+    if (completed !== null) {
+      const messages = completed.payload.messages as unknown as InboxMessage[];
+      if (messages.length) this.run.emit("received", { seq, ids: messages.map((item) => item.id) });
+      this.applied = seq;
+      return clone(messages);
+    }
+    this.goLive();
+    const store = this.journal.store as DurableStore;
+    const messages = store.inbox(this.run.sessionId, {
+      kinds: kinds ?? undefined,
+      pending: true,
+      limit: options.limit,
+    });
+    const recorded = messages.map((item) => ({ ...item, consumedBy: this.run.id }));
+    const entry: JournalEntry = { seq, phase: "completed", kind: "receive", key, payload: { messages: recorded as unknown as JsonObject[] } };
+    if (recorded.length) {
+      this.run.emit("received", { seq, ids: recorded.map((item) => item.id) });
+      await this.journal.appendConsuming(recorded.map((item) => item.id), entry);
+    } else {
+      // Nothing consumed: queued like a side effect; ordered writes make it durable before any later effect.
+      this.journal.enqueue(entry);
+    }
+    this.applied = seq;
+    return clone(recorded);
+  }
+
+  /**
+   * The operator's say at a node boundary: a Flow calls this before each node.
+   * With the session held, wait (the timeout clock stopped, the lease kept)
+   * until it is resumed or frozen. Frozen: write a checkpoint so recovery starts
+   * here, then stop with Frozen; the run stays recoverable. Control state is
+   * never journaled: it changes when a run proceeds, not which commands it issues.
+   */
+  async controlPoint(node: string): Promise<void> {
+    const store = this.store;
+    if (store === null || this.journal?.readonly) return;
+    const state = () => store.control(this.run.sessionId)?.state ?? "run";
+    if (state() === "hold") {
+      this.ensureActive();
+      this.run.emit("held", { node, note: store.control(this.run.sessionId)?.note ?? null });
+      this.journal?.flushEvents();
+      this.clock?.pause();
+      try {
+        await store.waitForSignal(this.run.sessionId, [], { deadline: null, signal: this.signal, interrupt: () => state() !== "hold" });
+      } finally {
+        this.clock?.resume();
+      }
+      this.ensureActive();
+      if (state() === "run") this.run.emit("resumed", { node });
+    }
+    if (state() === "freeze") await this.freeze(node);
+  }
+
+  /** Stop for an operator's freeze; `node` is the boundary, or null inside a node (a suspension). */
+  private async freeze(node: string | null): Promise<never> {
+    const journal = this.journal as RunJournal;
+    // Only live: a replay must not write where the journal has other commands.
+    if (node !== null && this.seqCounter >= journal.lastRecordedSeq) await this.checkpoint(node);
+    this.run.emit("frozen", { node, note: this.store?.control(this.run.sessionId)?.note ?? null });
+    journal.flushEvents();
+    await journal.flush();
+    throw new Frozen(`Run frozen by the operator${node === null ? "" : ` before ${node}`}`);
+  }
+
+  /** Ask for a checkpoint at the next node boundary of a Flow; compaction does this. */
+  requestCheckpoint(): void {
+    this.wantCheckpoint = true;
+  }
+
+  /** @internal Whether a checkpoint was requested and not yet written. */
+  get checkpointRequested(): boolean {
+    return this.wantCheckpoint;
+  }
+
+  /**
+   * Record what a recovery needs to restart before `node` without replaying
+   * what came before: the conversation, run.state, usage and counters. A Flow
+   * calls this between nodes; outside a node boundary it would be wrong. With
+   * pending tool calls nothing is written, and the request stays for the next
+   * boundary. run.state must be plain JSON; otherwise a skipped checkpoint is
+   * recorded (so replays stay aligned) and recovery replays from the start.
+   */
+  async checkpoint(node: string): Promise<void> {
+    this.ensureIdle();
+    if (this.pending.length || this.journal === null) return;
+    this.wantCheckpoint = false;
+    const seq = this.nextSeq();
+    const key = commandKey("checkpoint", { node });
+    const [, completed] = this.journal.check(seq, "checkpoint", key);
+    if (completed !== null) {
+      this.applied = seq;
+      return;
+    }
+    this.goLive();
+    const problem = jsonProblem(this.run.state, "run.state");
+    const payload: JsonObject =
+      problem === null
+        ? {
+            node,
+            messages: clone(this.run.messages) as unknown as JsonObject[],
+            state: clone(this.run.state) as JsonObject,
+            usage: { ...this.run.usage },
+            modelCalls: this.run.modelCalls,
+            toolCalls: this.run.toolCalls,
+            steps: this.run.steps,
+          }
+        : { node, skipped: problem };
+    // Emitted first, so the event is written with the checkpoint row.
+    if (problem === null) this.run.emit("checkpoint", { seq, node, messages: this.run.messages.length });
+    else this.run.emit("checkpoint_skipped", { seq, node, reason: problem });
+    await this.journal.append({ seq, phase: "completed", kind: "checkpoint", key, payload });
+    this.applied = seq;
+  }
+
+  /**
+   * @internal Restore the latest checkpoint of a recovered run's journal and
+   * return the node to restart at, or null to start from the beginning. A Flow
+   * calls this once, before its first node.
+   */
+  resumePoint(): string | null {
+    if (this.journal === null || this.seqCounter !== 0) return null;
+    const entry = this.journal.latestCheckpoint();
+    if (entry === null) return null;
+    const saved = entry.payload;
+    this.run.messages = (saved.messages as unknown as MessageInput[]).map((item) => message(item));
+    this.run.state = clone(saved.state as Record<string, unknown>);
+    this.run.usage = { ...(saved.usage as Record<string, number>) };
+    this.run.modelCalls = saved.modelCalls as number;
+    this.run.toolCalls = saved.toolCalls as number;
+    this.run.steps = saved.steps as number;
+    this.seqCounter = entry.seq;
+    this.applied = entry.seq;
+    this.pending = [];
+    this.replaying = this.journal.lastRecordedSeq > entry.seq;
+    if (this.liveEvent !== null) this.liveEvent = [this.liveEvent[0], { ...this.liveEvent[1], fromCheckpoint: entry.seq }];
+    return saved.node as string;
+  }
+
   /** @internal */
   ensureActive(): void {
     if (this.signal.aborted) throw this.signal.reason;
@@ -244,11 +557,12 @@ export class Runtime {
     this.run.emit("step", { node: name, step: this.run.steps, metadata: options.metadata ?? {} });
   }
 
-  say(content: string): void {
+  /** Add a user instruction; `pinned` keeps it through every compaction. */
+  say(content: string, options: { pinned?: boolean } = {}): void {
     this.ensureIdle();
     if (this.pending.length) throw new Error("Resolve pending tool calls before adding an instruction");
-    this.run.messages.push(message({ role: "user", content }));
-    this.run.emit("instruction", { content });
+    this.run.messages.push(message({ role: "user", content, metadata: options.pinned ? { pinned: true } : {} }));
+    this.run.emit("instruction", { content, ...(options.pinned ? { pinned: true } : {}) });
   }
 
   async complete(options: { allowTools?: boolean; purpose?: string } = {}): Promise<ModelResponse> {
@@ -302,6 +616,10 @@ export class Runtime {
     let key = "";
     if (this.journal !== null) {
       key = modelKey(request);
+      // A journal written before tool-name keys: match it by its own key.
+      const [oldScheduled, oldCompleted] = this.journal.recorded(seq);
+      const legacy = legacyModelKey(request);
+      if ((oldCompleted ?? oldScheduled)?.key === legacy) key = legacy;
       const [scheduled, completed] = this.journal.check(seq, "model", key);
       if (completed !== null) {
         const response = modelResponse(completed.payload.response as never);
@@ -629,8 +947,11 @@ export class Runtime {
       if (proposal === null || typeof proposal !== "object" || !Array.isArray(proposal.messages)) {
         throw new TypeError("Compaction strategy must return a CompactionProposal");
       }
-      const replacement = proposal.messages.map((item) => message(item));
-      if (replacement.some((item) => item.role === "system")) throw new Error("Compaction cannot insert system messages");
+      const proposed = proposal.messages.map((item) => message(item));
+      if (proposed.some((item) => item.role === "system")) throw new Error("Compaction cannot insert system messages");
+      // Pinned messages survive: kept after the replacement unless the strategy kept them itself.
+      const kept = new Set(proposed.filter(isPinned).map((item) => JSON.stringify(item)));
+      const replacement = [...proposed, ...source.filter((item) => isPinned(item) && !kept.has(JSON.stringify(item)))];
       const candidate = [...snapshot.slice(0, start), ...replacement, ...snapshot.slice(stop)];
       validateConversation(candidate);
       const afterTokens = await count(candidate);
@@ -658,6 +979,8 @@ export class Runtime {
       });
       this.run.messages.splice(0, this.run.messages.length, ...candidate);
       this.contextVersion += 1;
+      // What came before no longer shapes the conversation: a recovery can start here.
+      this.wantCheckpoint = true;
       return outcome;
     } catch (error) {
       if (!(error instanceof SessionLogError) && !isStopError(error)) {

@@ -1,6 +1,6 @@
 /** Build dist/: JS and declarations with tsc, then fix declaration imports and copy assets. */
 
-import { copyFileSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { copyFileSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 rmSync("dist", { recursive: true, force: true });
@@ -19,4 +19,6 @@ for (const file of walk("dist").filter((path) => path.endsWith(".d.ts"))) {
   writeFileSync(file, text.replace(/(from\s+["']\.{1,2}\/[^"']+)\.ts(["'])/g, "$1.js$2").replace(/(import\(["']\.{1,2}\/[^"']+)\.ts(["']\))/g, "$1.js$2"));
 }
 copyFileSync("src/python/worker.py", "dist/python/worker.py");
+mkdirSync("dist/desk/ui", { recursive: true });
+for (const name of readdirSync("src/desk/ui")) copyFileSync(join("src/desk/ui", name), join("dist/desk/ui", name));
 console.log("built dist/");

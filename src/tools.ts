@@ -5,7 +5,7 @@ import { MissingContext, describeError, isFatalToolError } from "./errors.ts";
 import type { Runtime } from "./runtime.ts";
 import type { ToolShared } from "./shared.ts";
 import type { ToolCall, ToolSpec } from "./types.ts";
-import { clone } from "./util.ts";
+import { type JsonObject, clone } from "./util.ts";
 
 /**
  * How recovery treats a call that was started but has no recorded result:
@@ -69,6 +69,11 @@ export class ToolContext {
     return this.require("shared", this.init.shared);
   }
 
+  /** The run's scope (agent.run(prompt, { scope })); empty outside a run. */
+  get scope(): JsonObject {
+    return this.init.runtime?.run.scope ?? {};
+  }
+
   /** An application context value; a missing one fails the run, not just the call. */
   get<T>(key: string): T {
     return this.require(key, this.values[key] as T | undefined, key in this.values);
@@ -88,9 +93,15 @@ type Shape = z.ZodObject<z.ZodRawShape>;
 
 export interface ToolDefinition<S extends Shape> {
   name: string;
-  description?: string;
-  /** Model-supplied arguments. Unknown keys and type mismatches are rejected. */
-  input?: S;
+  description?: string | ((scope: JsonObject) => string);
+  /**
+   * Model-supplied arguments. Unknown keys and type mismatches are rejected.
+   * A function builds them from the run's scope, e.g. an enum of the agents
+   * this task may start.
+   */
+  input?: S | ((scope: JsonObject) => S);
+  /** Whether the model sees this tool in a run with this scope. Default: always. */
+  available?: (scope: JsonObject) => boolean;
   tags?: Iterable<string>;
   effect?: Effect;
   run(args: z.output<S>, ctx: ToolContext): unknown;
@@ -103,23 +114,43 @@ export class Tool<S extends Shape = Shape> {
   readonly effect: Effect;
   readonly input: z.ZodObject<z.ZodRawShape>;
   readonly spec: ToolSpec;
+  /** Its description or input depends on the run's scope: bind() it before use. */
+  readonly scoped: boolean;
   private readonly fn: ToolDefinition<S>["run"];
+  private readonly definition: ToolDefinition<S>;
 
-  constructor(definition: ToolDefinition<S>) {
+  constructor(definition: ToolDefinition<S>, scope: JsonObject | null = null) {
     const effect = definition.effect ?? "unsafe";
     if (!EFFECTS.has(effect)) throw new Error(`effect must be one of ${[...EFFECTS].sort().join(", ")}`);
     if (!definition.name) throw new Error("A tool needs a name");
+    this.definition = definition;
     this.name = definition.name;
-    this.description = definition.description ?? "";
+    this.scoped = scope === null && (typeof definition.input === "function" || typeof definition.description === "function");
+    const description = typeof definition.description === "function" ? (scope === null ? "" : definition.description(scope)) : definition.description;
+    this.description = description ?? "";
     this.tags = new Set(definition.tags ?? []);
     this.effect = effect;
-    this.input = (definition.input ?? z.object({})).strict();
+    const input = typeof definition.input === "function" ? (scope === null ? z.object({}) : definition.input(scope)) : definition.input;
+    this.input = (input ?? z.object({})).strict();
     this.fn = definition.run;
     const { $schema: _, ...parameters } = z.toJSONSchema(this.input) as Record<string, unknown>;
-    this.spec = { name: this.name, description: this.description, parameters };
+    // An unbound scoped tool has no real schema; its spec marks it, so fingerprints still see the tool.
+    this.spec = { name: this.name, description: this.description, parameters: this.scoped ? { scoped: true } : parameters };
+  }
+
+  /** This tool as a run with `scope` sees it, or null when it is not available there. */
+  bind(scope: JsonObject): Tool<S> | null {
+    if (this.definition.available !== undefined && !this.definition.available(scope)) return null;
+    return this.scoped ? new Tool(this.definition, scope) : this;
   }
 
   async invoke(args: Record<string, unknown>, context: ToolContextInit = {}): Promise<ToolResult> {
+    if (this.scoped) {
+      // Called outside a runtime, e.g. directly in a test: bind to the context's scope first.
+      const bound = this.bind(context.runtime?.run.scope ?? {});
+      if (bound === null) return new ToolResult(null, `Tool ${this.name} is not available in this scope`);
+      return bound.invoke(args, context);
+    }
     const parsed = this.input.safeParse(args);
     if (!parsed.success) {
       return new ToolResult(null, `Invalid arguments for ${this.name}: ${z.prettifyError(parsed.error)}`);
@@ -179,6 +210,11 @@ export class Tools {
   /** Effect kind of a tool; an unknown tool performs nothing, so it is a read. */
   effect(name: string): Effect {
     return this.registry.get(name)?.effect ?? "read";
+  }
+
+  /** The tools a run with this scope sees: unavailable ones left out, scoped ones bound. */
+  bind(scope: JsonObject): Tools {
+    return new Tools(this.list().flatMap((item) => item.bind(scope) ?? []));
   }
 
   select(...tags: string[]): Tools {
